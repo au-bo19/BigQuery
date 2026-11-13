@@ -1,15 +1,16 @@
-# HTTP plumbing on top of the Downloads standard library (libcurl).
+# HTTP functions on the Downloads standard library (libcurl).
 #
-# libcurl gives us HTTP/2 (needed for gRPC), transparent gzip and connection
-# reuse without adding any dependency that is not shipped with Julia itself.
+# libcurl gives HTTP/2 (gRPC uses HTTP/2), gzip decompression and connection
+# reuse. Julia includes libcurl. Thus these functions add no dependency.
 
 """
     BigQueryError
 
-Thrown when BigQuery (or Google's auth service) rejects a request. `message` is
-the server's explanation, `reason` its machine-readable code (for example
-`invalidQuery`, `notFound`, `accessDenied`) and `status` the HTTP status, or 0
-when the error did not come from an HTTP response.
+BigQuery (or the Google authentication service) can refuse a request. Then the
+package throws this error. `message` is the explanation from the server. `reason`
+is the error code from the server, for example `invalidQuery`, `notFound` or
+`accessDenied`. `status` is the HTTP status. It is 0 if the error did not come from
+an HTTP response.
 """
 struct BigQueryError <: Exception
     message::String
@@ -27,7 +28,7 @@ function Base.showerror(io::IO, e::BigQueryError)
     isempty(extra) || print(io, " [", join(extra, ", "), "]")
 end
 
-"The request never produced an HTTP response (DNS, TLS, connection reset, timeout)."
+"The request did not get an HTTP response (DNS, TLS, connection reset or timeout)."
 struct NetworkError <: Exception
     message::String
 end
@@ -43,9 +44,9 @@ end
 const USER_AGENT = "BigQuery.jl/0.1 (gzip)"
 const GRPC_CONTENT_TYPE = "application/grpc"
 
-# CURL_HTTP_VERSION_2_PRIOR_KNOWLEDGE: speak HTTP/2 on a plain-text connection.
-# Only used when the storage endpoint is overridden with an http:// URL (tests,
-# local emulators); real endpoints negotiate HTTP/2 through TLS.
+# CURL_HTTP_VERSION_2_PRIOR_KNOWLEDGE: use HTTP/2 on a plain-text connection.
+# The package uses this value only if the storage endpoint has an http:// URL
+# (tests and local emulators). Real endpoints select HTTP/2 through TLS.
 const CURL_HTTP2_PRIOR_KNOWLEDGE = 5
 
 function is_grpc_request(headers)
@@ -62,11 +63,11 @@ const REQUEST_BODY_KEY = :BigQuery_request_body
 """
 Run `f()` (a `Downloads.request` call) with `body` as the request body.
 
-The body is handed to libcurl as an in-memory POST (`CURLOPT_COPYPOSTFIELDS`)
-from the downloader's hook rather than through Downloads' `input` stream. The
-stream-based upload has a race on reused connections: libcurl can ask for data
-before the feeding task has started, after which the body is sent empty and the
-request fails with "client read function EOF fail".
+The downloader hook gives the body to libcurl as an in-memory POST
+(`CURLOPT_COPYPOSTFIELDS`). The package does not use the `input` stream of
+Downloads. That stream has a race condition on reused connections: libcurl can ask
+for data before the task that supplies the data starts. Then libcurl sends an empty
+body, and the request fails with "client read function EOF fail".
 """
 with_request_body(f, body::Vector{UInt8}) = task_local_storage(f, REQUEST_BODY_KEY, body)
 
@@ -75,12 +76,12 @@ function make_downloader()
     dl.easy_hook = function (easy, info)
         body = get(task_local_storage(), REQUEST_BODY_KEY, nothing)
         if body isa Vector{UInt8}
-            # The size must be set first: libcurl copies that many bytes immediately.
+            # Set the size first. libcurl copies that number of bytes immediately.
             Curl.setopt(easy, CURLOPT_POSTFIELDSIZE, length(body))
             Curl.setopt(easy, Curl.CURLOPT_COPYPOSTFIELDS, body)
         end
         if is_grpc_request(info.headers)
-            # A read stream can sit idle while the server throttles or prepares data.
+            # A read stream can stay idle while the server limits the rate or prepares data.
             Curl.setopt(easy, Curl.CURLOPT_LOW_SPEED_TIME, 600)
             if startswith(info.url, "http://")
                 Curl.setopt(easy, Curl.CURLOPT_HTTP_VERSION, CURL_HTTP2_PRIOR_KNOWLEDGE)
@@ -138,7 +139,7 @@ function query_string(pairs)
     return join(parts, "&")
 end
 
-# Strip the query string so that error messages never echo request parameters.
+# Remove the query string. Then error messages do not show request parameters.
 url_for_message(url::AbstractString) = String(first(split(url, '?')))
 
 function http_request(dl::Downloads.Downloader, method::AbstractString, url::AbstractString;
@@ -150,7 +151,7 @@ function http_request(dl::Downloads.Downloader, method::AbstractString, url::Abs
         Downloads.request(url; method = method, output = out, headers = hdrs,
                           downloader = dl, throw = false, timeout = timeout)
     else
-        # Without this libcurl waits for a "100 Continue" before uploading over HTTP/1.1.
+        # Without this header, libcurl waits for "100 Continue" before it uploads over HTTP/1.1.
         push!(hdrs, "Expect" => nothing)
         with_request_body(body) do
             Downloads.request(url; method = method, output = out, headers = hdrs,
@@ -180,7 +181,7 @@ function parse_api_error(resp::HTTPResponse, what::AbstractString)
                 reason = string(something(get(err, "status", nothing), ""))
             end
         elseif err isa AbstractString
-            # OAuth-style errors: {"error": "...", "error_description": "..."}
+            # OAuth errors have this format: {"error": "...", "error_description": "..."}
             reason = String(err)
             message = string(something(get(data, "error_description", nothing), err))
         end

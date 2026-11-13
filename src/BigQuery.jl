@@ -1,9 +1,9 @@
 """
     BigQuery
 
-Query Google BigQuery from Julia and get a `DataFrame` back, or upload one to a
-table. Written entirely in Julia: no external tool or other language runtime is
-needed.
+Use this module to query Google BigQuery from Julia. A query gives a `DataFrame`.
+You can also upload a table to BigQuery. The module is written only in Julia. It
+does not use an external tool or a runtime of a different language.
 
 ```julia
 using BigQuery
@@ -13,9 +13,10 @@ df  = bq_query(con, "SELECT * FROM `my-project.my_dataset.my_table`")
 bq_write_table(con, "my_dataset.my_copy", df)
 ```
 
-Large results are downloaded through the BigQuery Storage Read API (Arrow over
-gRPC), falling back to parallel REST paging when that API is not available.
-Uploads are load jobs fed by a gzipped, resumable upload.
+The Storage Read API (Arrow through gRPC) downloads large results. If that API is
+not available, the module downloads the results as REST pages, in parallel. An
+upload is a load job. The module sends the rows to the load job through a
+resumable upload, with gzip compression.
 """
 module BigQuery
 

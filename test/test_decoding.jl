@@ -1,5 +1,5 @@
 @testset "JSON scanning" begin
-    # String unescaping must agree with a real JSON parser.
+    # The string unescape function must agree with a real JSON parser.
     samples = ["", "plain", "quote \" backslash \\ slash /", "ctrl \b\f\n\r\t \x01\x1f", "ünïcödé €", "😀 astral 𝄞",
                "ends with backslash \\", "\\\"", "{\"f\":[{\"v\":\"x\"}]}", "a,b]}"]
     for str in samples
@@ -8,7 +8,7 @@
         @test B.make_string(encoded, a, b, esc) == str
         @test next == ncodeunits(encoded) + 1
     end
-    # \u escapes, including a surrogate pair and a lone surrogate.
+    # \u escapes, with a surrogate pair and a surrogate without its pair.
     for (encoded, expected) in [("\"\\u0041\\u00e9\"", "Aé"), ("\"\\ud83d\\ude00!\"", "😀!"),
                                 ("\"\\ud83d x\"", "� x"), ("\"\\/\"", "/")]
         a, b, esc, _ = B.scan_string(encoded, 1, ncodeunits(encoded))
@@ -45,8 +45,8 @@ end
     ts(str) = B.parse_timestamp(str, 1, ncodeunits(str))
     @test ts("0") == DateTime(1970)
     @test ts("1700000000123456") == DateTime(2023, 11, 14, 22, 13, 20, 123)
-    @test ts("-1") == DateTime(1969, 12, 31, 23, 59, 59, 999)        # floors, never rounds up
-    @test ts("1.700000000123E9") == DateTime(2023, 11, 14, 22, 13, 20, 123)   # legacy float seconds
+    @test ts("-1") == DateTime(1969, 12, 31, 23, 59, 59, 999)        # rounds down, never up
+    @test ts("1.700000000123E9") == DateTime(2023, 11, 14, 22, 13, 20, 123)   # the old float-seconds format
 
     date(str) = B.parse_date(str, 1, ncodeunits(str))
     @test date("2024-02-29") == Date(2024, 2, 29) && date("0001-01-01") == Date(1, 1, 1)
@@ -71,7 +71,7 @@ end
     @test B.decode_rows!(cols, fields, body, 1, ncodeunits(body)) == 300
     check_table(B.to_dataframe(B.make_result(fields, cols)), truth)
 
-    # Appending a second page continues the same columns.
+    # A second page adds rows to the same columns.
     @test B.decode_rows!(cols, fields, body, 1, ncodeunits(body)) == 300
     @test length(cols[1]) == 600
 
@@ -80,7 +80,7 @@ end
     df = B.to_dataframe(B.make_result(fields, empty))
     @test nrow(df) == 0 && eltype(df.id) == Int64 && eltype(df.name) == String && eltype(df.tags) == Vector{String}
 
-    # A schema/row mismatch is reported, not silently mis-read.
+    # If the rows do not agree with the schema, the decoder throws an error. It does not read incorrect data.
     @test_throws BigQueryError B.decode_rows!(B.new_columns(fields), fields, "[{\"f\":[{\"v\":\"1\"}]}]", 1, 19)
 end
 
@@ -120,7 +120,7 @@ end
         check_table(B.to_dataframe(B.make_result(fields, B.align_columns(fields, names, cols))), truth)
     end
 
-    # Both wire formats must give identical results, down to the element types.
+    # The two wire formats must give the same results, and also the same element types.
     rows = rest_rows(truth)
     body = "[" * join(rows, ",") * "]"
     rest_cols = B.new_columns(fields)
@@ -133,7 +133,7 @@ end
         @test isequal(r, a)
     end
 
-    # Column order follows the requested fields even if Arrow orders differently.
+    # The column sequence is the sequence of the requested fields, also if the Arrow sequence is different.
     reordered = B.align_columns(fields[[3, 1]], names, cols)
     @test isequal(reordered[1], truth.name) && reordered[2] == truth.id
 end
@@ -156,6 +156,37 @@ end
     @test cols[3] isa Vector{BigFloat} && cols[3] == [BigFloat("1.5"), BigFloat(-1)]
     @test cols[4] == [0.1, -1.0e-9]
     @test cols[5] isa Vector{Vector{Int64}} && cols[5] == [[1, 2], Int64[]]
+
+    # A NUMERIC value with many digits: the Arrow decoder and the REST decoder must
+    # give the same Float64. One division of a rounded Float64 can round two times.
+    mismatches = 0
+    for unscaled in vcat(rand(Int128(10)^17:Int128(10)^28, 20_000), Int128[0, 1, -1, 2^53, -(2^53) - 1, Int128(10)^38 - 1])
+        digits = lpad(string(abs(unscaled)), 10, '0')
+        text = (unscaled < 0 ? "-" : "") * digits[1:end-9] * "." * digits[end-8:end]
+        arrow = B.cv(Float64, Arrow.Decimal{38,9,Int128}(unscaled))
+        arrow == B.parse_float(text, 1, ncodeunits(text)) || (mismatches += 1)
+    end
+    @test mismatches == 0
+    @test B.decimal_to_float(Int128(2543230519952347310236348560), 9) == 2.543230519952347e18
+    @test B.decimal_to_float(-5, 0) == -5.0 && B.decimal_to_float(7, 30) == 7.0e-30
+end
+
+@testset "ORDER BY at the top level" begin
+    @test B.has_order_by("SELECT * FROM t ORDER BY x")
+    @test B.has_order_by("SELECT a FROM t\nORDER\n  BY a DESC LIMIT 5")
+    @test B.has_order_by("SELECT a FROM t UNION ALL SELECT a FROM u ORDER BY a")
+    @test B.has_order_by("SELECT (SELECT 1) AS x FROM t order by x")
+    @test !B.has_order_by("SELECT * FROM t")
+    @test !B.has_order_by("SELECT ROW_NUMBER() OVER (PARTITION BY a ORDER BY b) AS r FROM t")
+    @test !B.has_order_by("SELECT ARRAY_AGG(x ORDER BY y) FROM t")
+    @test !B.has_order_by("SELECT * FROM (SELECT * FROM t ORDER BY x)")
+    @test !B.has_order_by("WITH c AS (SELECT * FROM t ORDER BY x) SELECT * FROM c")
+    @test !B.has_order_by("SELECT * FROM t -- TODO: order by later")
+    @test !B.has_order_by("SELECT * FROM t # order by x")
+    @test !B.has_order_by("SELECT * FROM t /* order by x */")
+    @test !B.has_order_by("SELECT 'order by' AS s, \"order by\" AS d, `order by` FROM t")
+    @test !B.has_order_by("SELECT '''it's an order by''' AS s, 'a\\'order by' AS e FROM t")
+    @test B.has_order_by("SELECT ')' AS p FROM t ORDER BY p")
 end
 
 @testset "column assembly" begin

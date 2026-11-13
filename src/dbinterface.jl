@@ -1,4 +1,4 @@
-# DBInterface.jl integration, Julia's common database interface:
+# Integration with DBInterface.jl, the common database interface of Julia:
 #
 #   con = DBInterface.connect(BigQuery.Connection, "my-project")
 #   df  = DBInterface.execute(con, "SELECT ...") |> DataFrame

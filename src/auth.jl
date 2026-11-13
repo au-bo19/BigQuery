@@ -1,5 +1,5 @@
-# Google credentials: everything needed to turn "who am I" into an OAuth access
-# token, implemented natively so no external tool is needed at run time.
+# Google credentials. These functions use the credentials to get an OAuth access
+# token. They are written in Julia, thus no external tool is necessary at run time.
 
 const DEFAULT_SCOPES = ["https://www.googleapis.com/auth/cloud-platform"]
 const GOOGLE_TOKEN_URI = "https://oauth2.googleapis.com/token"
@@ -13,19 +13,19 @@ mutable struct TokenCache
 end
 TokenCache() = TokenCache(ReentrantLock(), "", 0.0)
 
-"A fixed access token supplied by the caller. It cannot be refreshed."
+"An access token from the caller. The package cannot refresh it."
 struct StaticToken <: Credentials
     token::String
 end
 
-"A user-supplied function returning a fresh access token whenever it is called."
+"A function from the caller. Each call of the function returns a new access token."
 struct TokenProvider <: Credentials
     f::Any
     cache::TokenCache
 end
 TokenProvider(f) = TokenProvider(f, TokenCache())
 
-"A service account key (the JSON file downloaded from the Cloud console)."
+"A service account key (the JSON file from the Cloud console)."
 struct ServiceAccount <: Credentials
     client_email::String
     private_key::String
@@ -36,7 +36,7 @@ struct ServiceAccount <: Credentials
     cache::TokenCache
 end
 
-"User credentials with a refresh token, as written by `gcloud auth application-default login`."
+"User credentials with a refresh token. The command `gcloud auth application-default login` writes them."
 struct AuthorizedUser <: Credentials
     client_id::String
     client_secret::String
@@ -46,14 +46,14 @@ struct AuthorizedUser <: Credentials
     cache::TokenCache
 end
 
-"The metadata server available on Compute Engine VMs, GKE, Cloud Run, Vertex Workbench, ..."
+"The metadata server. It is available on Compute Engine VMs, GKE, Cloud Run, Vertex Workbench and other services."
 struct MetadataServer <: Credentials
     host::String
     cache::TokenCache
 end
 MetadataServer() = MetadataServer(get(ENV, "GCE_METADATA_HOST", "metadata.google.internal"), TokenCache())
 
-"Last resort: ask an installed `gcloud` CLI for a token."
+"The last option: get a token from an installed `gcloud` CLI."
 struct GcloudCLI <: Credentials
     path::String
     cache::TokenCache
@@ -66,7 +66,15 @@ Base.show(io::IO, ::AuthorizedUser) = print(io, "user credentials (refresh token
 Base.show(io::IO, ::MetadataServer) = print(io, "metadata server (VM service account)")
 Base.show(io::IO, ::GcloudCLI) = print(io, "gcloud CLI")
 
-# --- token retrieval --------------------------------------------------------
+"""
+The quota project of the credentials, or `nothing`. Google APIs use this project for
+the quota and the billing of calls with user credentials. The Google client libraries
+send it in the `x-goog-user-project` header. This package does the same.
+"""
+quota_project(::Credentials) = nothing
+quota_project(c::AuthorizedUser) = c.quota_project_id
+
+# --- get tokens -------------------------------------------------------------
 
 access_token(c::StaticToken, dl::Downloads.Downloader) = c.token
 invalidate!(c::StaticToken) = nothing
@@ -209,11 +217,11 @@ function fetch_token(c::GcloudCLI, dl::Downloads.Downloader)
     end
     token = String(strip(out))
     isempty(token) && throw(BigQueryError("`gcloud auth print-access-token` returned nothing.", "authError", 0))
-    # gcloud does not report the expiry; refresh well inside the one-hour lifetime.
+    # gcloud does not give the expiry time. Refresh the token well before the end of its one-hour life.
     return token, time() + 1500
 end
 
-# --- RS256 (service account JWT signing) through the OpenSSL bundled with Julia
+# --- RS256 (the JWT signature of a service account) with the OpenSSL in Julia
 
 base64url(data::Vector{UInt8}) = replace(rstrip(base64encode(data), '='), '+' => '-', '/' => '_')
 base64url(s::AbstractString) = base64url(Vector{UInt8}(codeunits(String(s))))
@@ -249,7 +257,7 @@ function rs256_sign(pem::AbstractString, data::Vector{UInt8})
     end
 end
 
-# --- building credentials ---------------------------------------------------
+# --- make credentials -------------------------------------------------------
 
 optional_string(x) = (x isa AbstractString && !isempty(x)) ? String(x) : nothing
 
@@ -309,12 +317,12 @@ function well_known_adc_path()
 end
 
 """
-Find credentials the way Google's own client libraries do (Application Default
-Credentials), in this order:
+Find the credentials in the same sequence as the Google client libraries
+(Application Default Credentials):
 
-1. the file named by the `GOOGLE_APPLICATION_CREDENTIALS` environment variable;
-2. the file written by `gcloud auth application-default login`;
-3. the metadata server (when running on Google Cloud);
+1. the file in the `GOOGLE_APPLICATION_CREDENTIALS` environment variable;
+2. the file that `gcloud auth application-default login` writes;
+3. the metadata server (on Google Cloud);
 4. an installed `gcloud` CLI.
 """
 function default_credentials(dl::Downloads.Downloader; scopes = DEFAULT_SCOPES)

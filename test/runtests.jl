@@ -10,12 +10,14 @@ include("fixtures.jl")
 using .Fixtures
 include("mockbq.jl")
 using .MockBQ
+include("grpcmock.jl")
+using .GrpcMock: GrpcMock
 
-# What a column should look like once returned: Missing dropped from the element
-# type when the column holds no missing value.
+# The expected form of a returned column. If the column has no missing value, its
+# element type does not include Missing.
 narrow(c) = any(ismissing, c) ? c : convert(Vector{nonmissingtype(eltype(c))}, c)
 
-# Gzip, undone by an implementation other than the package's own.
+# Gzip decompression with a different implementation (not the gzip code of the package).
 gunzip(data) = transcode(CodecZlib.GzipDecompressor, Vector{UInt8}(data))
 is_gzip(data) = ncodeunits(data) >= 2 && codeunit(data, 1) == 0x1f && codeunit(data, 2) == 0x8b
 is_gzip(data::Vector{UInt8}) = length(data) >= 2 && data[1] == 0x1f && data[2] == 0x8b

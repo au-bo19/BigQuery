@@ -1,10 +1,10 @@
-# Decoding BigQuery's REST row format straight into typed columns.
+# Decode the REST row format of BigQuery directly into typed columns.
 #
-# The REST API returns rows as  {"f":[{"v":"1"},{"v":null},{"v":{"f":[...]}}]}
-# with every scalar encoded as a JSON string. Parsing that through a generic
-# JSON library allocates an object per cell, which is what makes naive clients
-# crawl on millions of rows. Here the bytes are scanned once, driven by the
-# schema, and values are written directly into column vectors.
+# The REST API returns rows as  {"f":[{"v":"1"},{"v":null},{"v":{"f":[...]}}]}.
+# Each scalar is a JSON string. A generic JSON library makes one object for each
+# cell. On millions of rows, that makes a simple client very slow. This file reads
+# the bytes one time. The schema controls the decoder, and the decoder writes the
+# values directly into the column vectors.
 
 @inline cu(s::String, i::Int) = @inbounds codeunit(s, i)
 
@@ -31,7 +31,7 @@ end
     return i + 1
 end
 
-# `i` is at the opening quote. Returns (first, last, has_escapes, next).
+# `i` is at the opening quote. The function returns (first, last, has_escapes, next).
 @inline function scan_string(s::String, i::Int, n::Int)
     j = i + 1
     esc = false
@@ -49,7 +49,7 @@ end
     scan_fail(s, i, "unterminated string")
 end
 
-# Expects  "<key>":  where key is a single ASCII character (BigQuery uses "f" and "v").
+# Reads  "<key>":  The key is one ASCII character (BigQuery uses "f" and "v").
 @inline function expect_key(s::String, i::Int, n::Int, key::UInt8)
     i = skip_ws(s, i, n)
     (i + 2 <= n && cu(s, i) == UInt8('"') && cu(s, i + 1) == key && cu(s, i + 2) == UInt8('"')) ||
@@ -145,7 +145,7 @@ function unescape_json(s::String, a::Int, b::Int)
                     i += 6
                 end
             end
-            (0xD800 <= cp <= 0xDFFF) && (cp = 0xFFFD)   # lone surrogate
+            (0xD800 <= cp <= 0xDFFF) && (cp = 0xFFFD)   # a surrogate without its pair
             append!(out, codeunits(string(Char(cp))))
         else
             push!(out, e)   # \" \\ \/
@@ -160,7 +160,7 @@ function make_string(s::String, a::Int, b::Int, esc::Bool)
     return GC.@preserve s unsafe_string(pointer(s, a), b - a + 1)
 end
 
-"Byte ranges of the values of a JSON object's top-level keys."
+"The byte ranges of the values of the top-level keys of a JSON object."
 function top_level_spans(s::String)
     n = ncodeunits(s)
     spans = Dict{String,UnitRange{Int}}()
@@ -191,8 +191,9 @@ function top_level_spans(s::String)
 end
 
 """
-Split a REST response into its metadata (everything except `rows`, parsed
-normally) and the byte range of the `rows` array, which is decoded separately.
+Divide a REST response into two parts. The first part is the metadata (all the
+keys except `rows`), parsed as usual. The second part is the byte range of the
+`rows` array. A different function decodes that array.
 """
 function split_response(raw::Vector{UInt8})
     s = String(raw)
@@ -219,7 +220,7 @@ end
     i = neg ? a + 1 : a
     i <= b || scan_fail(s, a, "invalid integer")
     x = Int64(0)
-    # Accumulate as a negative number so that typemin(Int64) parses.
+    # Calculate the value as a negative number. Then typemin(Int64) is also possible.
     while i <= b
         x = x * 10 - digit(s, i)
         i += 1
@@ -246,9 +247,9 @@ const UNIX_EPOCH_DAYS = Dates.value(Date(1970))
     return true
 end
 
-# TIMESTAMP arrives as integer microseconds since the epoch (we ask for that
-# with formatOptions.useInt64Timestamp); the legacy float-seconds form is
-# handled as well in case a server ignores the option.
+# A TIMESTAMP arrives as integer microseconds since the epoch. The request asks
+# for this format with formatOptions.useInt64Timestamp. The function also reads
+# the old format (float seconds), if a server does not use the option.
 @inline function parse_timestamp(s::String, a::Int, b::Int)
     us = is_integer_text(s, a, b) ? parse_int(s, a, b) : round(Int64, parse_float(s, a, b) * 1.0e6)
     return datetime_from_unix_ms(fld(us, 1000))
@@ -267,7 +268,7 @@ end
     return Date(y, m, d)
 end
 
-# "HH:MM:SS[.ffffff]" starting at `a` -> nanoseconds since midnight
+# "HH:MM:SS[.ffffff]" starts at `a`. The result is the nanoseconds since midnight.
 @inline function parse_hms_ns(s::String, a::Int, b::Int)
     b - a >= 7 || scan_fail(s, a, "invalid time of day")
     h = digit(s, a) * 10 + digit(s, a + 1)
@@ -275,7 +276,7 @@ end
     sec = digit(s, a + 6) * 10 + digit(s, a + 7)
     frac = 0
     scale = 100_000_000
-    i = a + 9          # first fractional digit, when present
+    i = a + 9          # the first fractional digit, if there is one
     while i <= b && scale > 0
         c = cu(s, i)
         (UInt8('0') <= c <= UInt8('9')) || break
@@ -309,9 +310,9 @@ function scalar_value(kind::Kind, s::String, a::Int, b::Int, esc::Bool)
     return make_string(s, a, b, esc)
 end
 
-# --- nested values (slow path: STRUCT, ARRAY, unknown types) -----------------
+# --- nested values (the slow procedure: STRUCT, ARRAY, unknown types) --------
 
-# One non-repeated value, or `missing`. `i` is at the start of the value.
+# One value that is not repeated, or `missing`. `i` is at the start of the value.
 function read_single(f::Field, s::String, i::Int, n::Int)
     i <= n || scan_fail(s, i, "unexpected end of data")
     c = cu(s, i)
@@ -333,7 +334,7 @@ function read_single(f::Field, s::String, i::Int, n::Int)
         i = expect(s, i, n, UInt8('}'))
         return (f.T(Tuple(vals)), i)
     elseif c != UInt8('"')
-        # Not a string: keep the raw JSON text (types this package does not model).
+        # The value is not a string. Keep the raw JSON text (for types that this package does not model).
         j = skip_value(s, i, n)
         return (String(codeunits(s)[i:j-1]), j)
     else
@@ -342,7 +343,7 @@ function read_single(f::Field, s::String, i::Int, n::Int)
     end
 end
 
-# A value of field `f`, which may be repeated. `i` is at the start of the value.
+# A value of field `f`. The field can be repeated. `i` is at the start of the value.
 function read_value(f::Field, s::String, i::Int, n::Int)
     f.repeated || return read_single(f, s, i, n)
     out = Vector{f.T}()
@@ -373,8 +374,8 @@ end
 
 # --- rows -------------------------------------------------------------------
 
-# Reads one cell `{"v": ...}` into column `j`. The branches assert each
-# column's concrete type so the hot path involves no dynamic dispatch.
+# Reads one cell `{"v": ...}` into column `j`. Each branch asserts the concrete type
+# of the column. Thus the frequent operations do not use dynamic dispatch.
 @inline function read_cell!(cols::Vector{Any}, j::Int, f::Field, s::String, i::Int, n::Int)
     i = expect(s, i, n, UInt8('{'))
     i = expect_key(s, i, n, UInt8('v'))
@@ -431,8 +432,8 @@ end
 end
 
 """
-Decode the JSON `rows` array occupying bytes `lo:hi` of `s`, appending to
-`cols` (as created by `new_columns(fields)`). Returns the number of rows read.
+Decode the JSON `rows` array in the bytes `lo:hi` of `s`. Add the rows to `cols`
+(from `new_columns(fields)`). Return the number of rows.
 """
 function decode_rows!(cols::Vector{Any}, fields::Vector{Field}, s::String, lo::Int, hi::Int)
     n = hi

@@ -1,5 +1,5 @@
-# A small in-process imitation of the BigQuery REST API (and Google's OAuth
-# token endpoint), enough to exercise BigQuery.jl without a Google account.
+# A small in-process copy of the BigQuery REST API (and of the Google OAuth token
+# endpoint). It has sufficient functions to test BigQuery.jl without a Google account.
 
 module MockBQ
 
@@ -9,7 +9,7 @@ export Server, add_table!, add_query!, stop!, requests, reset_log!
 
 mutable struct Table
     schema::Any
-    rows::Vector{String}      # pre-rendered `{"f":[...]}` rows
+    rows::Vector{String}      # the rows as `{"f":[...]}` text, ready to send
     kind::String
 end
 
@@ -19,19 +19,20 @@ mutable struct Server
     lock::ReentrantLock
     tables::Dict{String,Table}          # "dataset.table"
     queries::Dict{String,Any}           # sql => behaviour
-    jobs::Dict{String,Any}              # job id => (table key, polls left, ...)
+    jobs::Dict{String,Any}              # job id => (table key, polls that remain, ...)
     log::Vector{Any}
-    max_page_rows::Int                  # the server-side cap on rows per response
-    fail_data_requests::Int             # answer this many data requests with a 503
-    reject_tokens::Set{String}          # tokens answered with 401
+    max_page_rows::Int                  # the server limit for the rows in one response
+    fail_data_requests::Int             # send a 503 for this number of data requests
+    reject_tokens::Set{String}          # send a 401 for these tokens
     tokens_issued::Int
     job_counter::Int
-    uploads::Dict{String,Any}           # upload id => the job and the bytes received so far
-    upload_accept_bytes::Int            # keep at most this many bytes of each upload request
-    fail_upload_requests::Int           # answer this many upload requests with a 503, storing nothing
-    lose_upload_responses::Int          # store the bytes of this many upload requests, then answer 503
-    load_polls::Int                     # report a load job as RUNNING this many times
-    max_gzip_bytes::Int                 # load jobs fail on a gzip file larger than this (4 GB in BigQuery)
+    uploads::Dict{String,Any}           # upload id => the job and the bytes that the server has
+    upload_accept_bytes::Int            # keep this number of bytes of each upload request, maximum
+    fail_upload_requests::Int           # send a 503 for this number of upload requests, and keep nothing
+    lose_upload_responses::Int          # keep the bytes of this number of upload requests, then send a 503
+    load_polls::Int                     # show a load job as RUNNING this number of times
+    max_gzip_bytes::Int                 # a load job fails on a gzip file larger than this (4 GB in BigQuery)
+    missing_datasets::Set{String}       # datasets that do not exist
 end
 
 url(s::Server) = "http://127.0.0.1:$(s.port)"
@@ -51,10 +52,10 @@ function add_table!(s::Server, key::String, schema, rows::Vector{String}; kind =
 end
 
 """
-Register what a SQL text does. `behaviour` keys: `table` (result table key),
-`error` (`(reason, message)`), `polls` (answer "not complete" this many times),
-`script` (no destination table), `dml` (affected rows), `anonymous` (hide the
-job's destination table lookup behind an error).
+Set the behaviour of a SQL text. The keys of `behaviour`: `table` (the key of the
+result table), `error` (`(reason, message)`), `polls` (send "not complete" this
+number of times), `script` (no destination table), `dml` (the affected rows),
+`anonymous` (send an error for the destination table of the job).
 """
 add_query!(s::Server, sql::String; kwargs...) = lock(() -> (s.queries[sql] = Dict{Symbol,Any}(kwargs)), s.lock)
 
@@ -70,7 +71,7 @@ function page(s::Server, table::Table, start::Int, max_results::Int; with_schema
     with_schema && print(io, "\"schema\":", JSON.json(table.schema), ",")
     print(io, "\"totalRows\":\"", total, "\",")
     if count > 0
-        # Rows first, token after, with odd spacing: the client must not rely on layout.
+        # The rows come first and the token after them, with unusual spaces. The client must not depend on the layout.
         print(io, "\"rows\": [", join(rows, " ,\n "), "] ,")
     end
     start + count < total && print(io, "\"pageToken\":\"idx:", start + count, "\",")
@@ -101,7 +102,8 @@ function handle(s::Server, req::HTTP.Request)
     lock(s.lock) do
         push!(s.log, (method = req.method, path = path, params = params, body = body,
                       auth = HTTP.header(req, "Authorization", ""),
-                      range = HTTP.header(req, "Content-Range", "")))
+                      range = HTTP.header(req, "Content-Range", ""),
+                      user_project = HTTP.header(req, "x-goog-user-project", "")))
     end
 
     if path == "/token"
@@ -205,7 +207,9 @@ function handle(s::Server, req::HTTP.Request)
     # --- tables.get / tabledata.list ----------------------------------------
     m = match(r"^datasets/([^/]+)/tables/([^/]+)(/data)?$", rest)
     if req.method == "GET" && m !== nothing
-        key = m.captures[1] * "." * m.captures[2]
+        dataset = String(m.captures[1])
+        dataset in s.missing_datasets && return error_response(404, "notFound", "Not found: Dataset $project:$dataset")
+        key = dataset * "." * m.captures[2]
         table = lock(() -> get(s.tables, key, nothing), s.lock)
         table === nothing && return error_response(404, "notFound", "Not found: Table $project:$key")
         if m.captures[3] === nothing
@@ -220,7 +224,9 @@ function handle(s::Server, req::HTTP.Request)
         selected = get(params, "selectedFields", "")
         if !isempty(selected)
             names = split(selected, ',')
-            idx = [findfirst(f -> f["name"] == n, table.schema["fields"]) for n in names]
+            # As in BigQuery, the selected columns come in the sequence of the table
+            # schema, not in the sequence of the request.
+            idx = sort([findfirst(f -> f["name"] == n, table.schema["fields"]) for n in names])
             table = Table(Dict("fields" => table.schema["fields"][idx]),
                           [JSON.json(Dict("f" => JSON.parse(r)["f"][idx])) for r in table.rows], table.kind)
         end
@@ -238,7 +244,7 @@ function query_page(s::Server, req, job, ref, start::Int, max_results::Int)
     end
     table = lock(() -> s.tables[behaviour[:table]], s.lock)
     body = page(s, table, start, max_results)
-    # Splice the job facts into the page object.
+    # Put the job data into the page object.
     body = "{" * chop(JSON.json(extra); head = 1, tail = 1) * "," * chop(body; head = 1, tail = 0)
     return gzip_response(req, body)
 end
@@ -262,8 +268,8 @@ function timestamp_micros(v::AbstractString)
 end
 
 """
-Check one value of a newline-delimited JSON row against its column, strictly,
-and convert it to the way the REST API returns values of that type.
+Examine one value of a newline-delimited JSON row against its column, strictly.
+Change it to the format that the REST API uses for values of that type.
 """
 function load_value(v, field; element = false)
     typ = uppercase(field["type"])
@@ -318,7 +324,7 @@ function load_value(v, field; element = false)
     mismatch(field, v)
 end
 
-"Apply a finished upload to the tables, as a load job would. Returns the number of rows loaded."
+"Apply a completed upload to the tables, as a load job does. Return the number of loaded rows."
 function apply_load!(s::Server, key::String, config, data::String)
     disposition = get(config, "writeDisposition", "WRITE_APPEND")
     table = get(s.tables, key, nothing)
@@ -379,7 +385,7 @@ function finish_load(s::Server, project::String, upload)
     status = Dict{String,Any}("state" => "DONE")
     statistics = Dict{String,Any}()
     try
-        # Compression is not announced: a gzip file is recognised by how it starts.
+        # The upload does not say that it uses compression. The mock finds a gzip file from its first bytes.
         data = upload[:data]
         upload[:gzip] = length(data) >= 2 && data[1] == 0x1f && data[2] == 0x8b
         (upload[:gzip] && length(data) > s.max_gzip_bytes) && throw(LoadError("invalid",
@@ -405,7 +411,7 @@ resume_incomplete(received::Int) =
 
 unavailable() = error_response(503, "backendError", "Service unavailable, try again")
 
-"The resumable upload protocol: one POST opens a session, PUTs carry the bytes."
+"The resumable upload protocol: one POST opens a session, and PUT requests send the bytes."
 function handle_upload(s::Server, req::HTTP.Request, project::String, path::AbstractString, params)
     if req.method == "POST"
         get(params, "uploadType", "") == "resumable" ||
@@ -435,10 +441,10 @@ function handle_upload(s::Server, req::HTTP.Request, project::String, path::Abst
             first, last = parse(Int, m.captures[1]), parse(Int, m.captures[2])
             last - first + 1 == length(req.body) ||
                 return error_response(400, "invalid", "Content-Range does not match the body size")
-            # Only the last chunk may have an odd size.
+            # Only the last chunk can have a size that is not a multiple of 256 KiB.
             (total === nothing && length(req.body) % (256 * 1024) != 0) &&
                 return error_response(400, "invalid", "Chunk size must be a multiple of 262144 bytes")
-            # Bytes at the wrong offset are ignored; the 308 below says where to resume.
+            # The mock ignores bytes at an incorrect offset. The 308 response below gives the correct offset.
             first == length(data) && append!(data, req.body[1:min(length(req.body), s.upload_accept_bytes)])
         elseif !isempty(req.body)
             return error_response(400, "invalid", "A status request must not carry data")
@@ -458,7 +464,7 @@ end
 function Server(; max_page_rows::Int = typemax(Int))
     s = Server(nothing, 0, ReentrantLock(), Dict{String,Table}(), Dict{String,Any}(), Dict{String,Any}(),
                Any[], max_page_rows, 0, Set{String}(), 0, 0,
-               Dict{String,Any}(), typemax(Int), 0, 0, 0, 4_000_000_000)
+               Dict{String,Any}(), typemax(Int), 0, 0, 0, 4_000_000_000, Set{String}())
     port, listener = Sockets.listenany(Sockets.ip"127.0.0.1", 18_200 + rand(0:2000))
     http = HTTP.serve!("127.0.0.1", Int(port); server = listener, verbose = false) do req
         try

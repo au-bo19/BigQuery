@@ -39,8 +39,8 @@
             @test length(pages) >= 1
             @test all(r -> get(r.params, "formatOptions.useInt64Timestamp", "") == "true", pages)
 
-            # The server caps pages well below what is asked for (as BigQuery does at 10 MB);
-            # every row must still arrive, in order, exactly once.
+            # The server sends pages much smaller than requested (BigQuery does this at 10 MB).
+            # Each row must arrive one time, in the correct sequence.
             server.max_page_rows = 1_234
             for concurrency in (1, 8)
                 df = bq_query(con, "SELECT large"; method = :rest, progress = false,
@@ -76,8 +76,8 @@
             reset_log!(server)
             check_table(bq_query(con, "SELECT slow"), small)
             polls = filter(r -> r.method == "GET" && occursin("/queries/job_", r.path), requests(server))
-            @test length(polls) == 4          # three "not yet" answers, then the result
-            @test all(r -> r.params["location"] == "US", polls)      # the job's location is carried along
+            @test length(polls) == 4          # three "not complete" responses, then the result
+            @test all(r -> r.params["location"] == "US", polls)      # each poll sends the location of the job
         end
 
         @testset "errors" begin
@@ -209,10 +209,24 @@
             df = bq_read_table(con, "proj.ds.large"; method = :rest, progress = false)
             check_table(df, large)
             server.max_page_rows = 900
+            reset_log!(server)
             df = bq_read_table(con, "`ds.large`"; method = :rest, progress = false, columns = ["name", "id"])
             server.max_page_rows = typemax(Int)
             @test names(df) == ["name", "id"]
             @test isequal(df.name, large.name) && df.id == large.id
+            # The request names the columns in the sequence of the table schema. Then the
+            # sequence of the response is clear (BigQuery uses the schema sequence).
+            pages = filter(r -> endswith(r.path, "/data"), requests(server))
+            @test !isempty(pages) && all(r -> r.params["selectedFields"] == "id,name", pages)
+            # Two columns of the same type, in the opposite sequence: the values must not change places.
+            df = bq_read_table(con, "ds.large"; method = :rest, progress = false, columns = ["d", "x", "id"])
+            @test names(df) == ["d", "x", "id"] && df.d == large.d && isequal(df.x, large.x) && df.id == large.id
+            pair_schema = Dict("fields" => Any[Dict("name" => "first", "type" => "STRING"),
+                                               Dict("name" => "second", "type" => "STRING")])
+            add_table!(server, "ds.pair", pair_schema, ["{\"f\":[{\"v\":\"one\"},{\"v\":\"two\"}]}"])
+            df = bq_read_table(con, "ds.pair"; method = :rest, columns = ["second", "first"])
+            @test names(df) == ["second", "first"] && df.second == ["two"] && df.first == ["one"]
+            @test_throws ArgumentError bq_read_table(con, "ds.pair"; method = :rest, columns = ["first", "first"])
             @test nrow(bq_read_table(con, "ds.empty"; method = :rest)) == 0
             @test_throws ArgumentError bq_read_table(con, "ds.large"; columns = ["nope"], method = :rest)
             @test_throws ArgumentError bq_read_table(con, "just_a_table"; method = :rest)
@@ -223,7 +237,7 @@
             end
             @test err isa BigQueryError && err.status == 404 && err.reason == "notFound"
 
-            # A filter cannot be applied by tabledata.list, and views have no stored rows: both go through a query.
+            # tabledata.list cannot apply a filter, and views have no stored rows. Thus both use a query.
             add_query!(server, "SELECT `id`, `x` FROM `proj.ds.large` WHERE id <= 50"; table = "ds.small")
             reset_log!(server)
             df = bq_read_table(con, "ds.large"; method = :rest, columns = ["id", "x"], where = "id <= 50")

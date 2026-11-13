@@ -1,18 +1,19 @@
-# Running queries and assembling results.
+# Run queries and make the results.
 
-# Rows requested with the query itself. Results that fit come back in a single
-# round trip; anything bigger is downloaded in bulk afterwards.
+# The number of rows that the query request asks for. If the result has fewer rows,
+# one request is sufficient. If it has more rows, the package downloads all the rows
+# after the query.
 const FIRST_PAGE_ROWS = 10_000
 const POLL_TIMEOUT_MS = 10_000
 
 """
     BigQuery.QueryResult
 
-What `DBInterface.execute` returns: the result columns plus some facts about
-the job. It is a Tables.jl table, so `DataFrame(result)` (or any other sink)
-works. Fields of interest: `job_id`, `location`, `total_rows`, `affected_rows`
-(DML statements), `bytes_processed`, `cache_hit` and `method` (`:inline`,
-`:arrow` or `:rest`, how the rows were downloaded).
+The result of `DBInterface.execute`: the result columns and data about the job. It
+is a Tables.jl table, thus `DataFrame(result)` (or a different sink) works.
+Important fields: `job_id`, `location`, `total_rows`, `affected_rows` (for DML
+statements), `bytes_processed`, `cache_hit` and `method`. `method` shows how the
+package downloaded the rows: `:inline`, `:arrow` or `:rest`.
 """
 struct QueryResult
     names::Vector{Symbol}
@@ -78,7 +79,7 @@ parse_count(x::Integer) = Int(x)
 parse_count(x) = 0
 optional_count(x) = x === nothing ? nothing : parse_count(x)
 
-"Accepts `project.dataset.table`, `dataset.table` or `project:dataset.table`, optionally back-quoted."
+"Accepts `project.dataset.table`, `dataset.table` or `project:dataset.table`, optionally in back quotes."
 function parse_table(conn::Connection, name::AbstractString)
     parts = split(replace(strip(name), '`' => "", ':' => '.'), '.')
     if length(parts) == 3
@@ -100,8 +101,68 @@ function dataset_reference(conn::Connection, dataset::AbstractString)
     throw(ArgumentError("expected a dataset like \"dataset\" or \"project.dataset\", got \"$dataset\""))
 end
 
-# A top-level ORDER BY means row order matters: read the result on one stream.
-has_order_by(sql::AbstractString) = occursin(r"\border\s+by\b"i, sql)
+"The index after the end of the quoted text that starts at `i` (a quote character)."
+function skip_quoted(s::AbstractVector{UInt8}, i::Int)
+    n = length(s)
+    q = s[i]
+    triple = i + 2 <= n && s[i+1] == q && s[i+2] == q
+    j = triple ? i + 3 : i + 1
+    while j <= n
+        c = s[j]
+        if c == UInt8('\\')
+            j += 2
+        elseif c == q && (!triple || (j + 2 <= n && s[j+1] == q && s[j+2] == q))
+            return triple ? j + 3 : j + 1
+        else
+            j += 1
+        end
+    end
+    return n + 1
+end
+
+"""
+Return true if the statement has an `ORDER BY` at the top level. Then the row
+sequence is important, and the package reads the result on one stream.
+
+The function ignores comments, string literals, quoted identifiers and all the text
+in parentheses. Thus an `ORDER BY` in a window (`OVER (ORDER BY x)`), in a subquery
+or in an aggregate function does not count.
+"""
+function has_order_by(sql::AbstractString)
+    s = codeunits(String(sql))
+    n = length(s)
+    out = IOBuffer()
+    depth = 0
+    i = 1
+    while i <= n
+        c = s[i]
+        if c == UInt8('#') || (c == UInt8('-') && i < n && s[i+1] == UInt8('-'))
+            while i <= n && s[i] != UInt8('\n')
+                i += 1
+            end
+            write(out, UInt8(' '))
+        elseif c == UInt8('/') && i < n && s[i+1] == UInt8('*')
+            j = i + 2
+            while j < n && !(s[j] == UInt8('*') && s[j+1] == UInt8('/'))
+                j += 1
+            end
+            i = j + 2
+            write(out, UInt8(' '))
+        elseif c == UInt8('\'') || c == UInt8('"') || c == UInt8('`')
+            i = skip_quoted(s, i)
+            write(out, UInt8(' '))
+        else
+            if c == UInt8('(')
+                depth += 1
+            elseif c == UInt8(')')
+                depth = max(depth - 1, 0)
+            end
+            write(out, depth == 0 && c != UInt8(')') ? c : UInt8(' '))
+            i += 1
+        end
+    end
+    return occursin(r"\border\s+by\b"i, String(take!(out)))
+end
 
 function job_path(project::AbstractString, job_id::AbstractString)
     return "projects/$(escapeuri(project))/jobs/$(escapeuri(job_id))"
@@ -140,11 +201,12 @@ function storage_fallback_warning(e)
 end
 
 """
-Try the Storage Read API; return `nothing` when the caller should use REST
-instead. With `method = :auto` any failure of the fast path (no permission, no
-HTTP/2, a data type Arrow.jl cannot decode, a row count that does not match
-`expected_rows`, ...) falls back to REST with a warning; with `method = :arrow`
-it is an error.
+Try the Storage Read API. Return `nothing` if the caller must use REST.
+
+With `method = :auto`, a failure of the fast procedure causes a warning, and the
+caller then uses REST. Examples of failures: no permission, no HTTP/2, a data type
+that Arrow.jl cannot decode, or a row count that is different from `expected_rows`.
+With `method = :arrow`, a failure is an error.
 """
 function try_arrow(conn::Connection, method::Symbol, table::TableRef, fields::Vector{Field};
                    expected_rows::Union{Nothing,Int} = nothing, kwargs...)
@@ -158,9 +220,9 @@ function try_arrow(conn::Connection, method::Symbol, table::TableRef, fields::Ve
         return cols
     catch e
         (method == :auto && !(e isa InterruptException)) || rethrow()
-        (e isa GrpcError && e.code == 1) && rethrow()        # cancelled
+        (e isa GrpcError && e.code == 1) && rethrow()        # the call was cancelled
         storage_fallback_warning(e)
-        # A permission problem will not fix itself; do not retry on every query.
+        # A permission problem does not go away. Do not try again on each query.
         (e isa GrpcError && e.code in (7, 12)) && (conn.storage_ok = false)
         return nothing
     end
@@ -173,7 +235,7 @@ function check_method(method::Symbol)
 end
 
 """
-Run `sql` and download its result. Returns a [`QueryResult`](@ref).
+Run `sql` and download its result. Return a [`QueryResult`](@ref).
 """
 function run_query(conn::Connection, sql::AbstractString;
                    params = nothing,
@@ -196,7 +258,7 @@ function run_query(conn::Connection, sql::AbstractString;
         "useQueryCache" => use_cache,
         "timeoutMs" => POLL_TIMEOUT_MS,
         "maxResults" => FIRST_PAGE_ROWS,
-        "requestId" => string(uuid4()),       # makes retrying the POST safe
+        "requestId" => string(uuid4()),       # with this ID, a second POST of the same request is safe
         "formatOptions" => Dict{String,Any}("useInt64Timestamp" => true),
     )
     location === nothing || (body["location"] = String(location))
@@ -223,7 +285,7 @@ function run_query(conn::Connection, sql::AbstractString;
         loc isa AbstractString && (job_location = String(loc))
     end
 
-    # Long-running query: wait for it, a poll at a time.
+    # A long query: wait for it, one poll at a time.
     try
         while get(meta, "jobComplete", false) !== true
             isempty(job_id) && throw(BigQueryError("BigQuery did not return a job reference for an unfinished query"))
@@ -236,7 +298,7 @@ function run_query(conn::Connection, sql::AbstractString;
             s, meta, range = split_response(raw)
         end
     catch e
-        # Ctrl-C while waiting: do not leave the query running (and billing).
+        # Ctrl-C during the wait: cancel the query. Then it does not continue, and BigQuery does not bill it.
         (e isa InterruptException && !isempty(job_id)) && cancel_job(conn, job_project, job_id, job_location)
         rethrow()
     end
@@ -256,7 +318,7 @@ function run_query(conn::Connection, sql::AbstractString;
         return make_result(fields, first_cols; stats..., method = :inline)
     end
 
-    # The result did not fit in the first page: bulk download.
+    # The first page did not contain all the rows: download them in bulk.
     isempty(job_id) && throw(BigQueryError("BigQuery returned a partial result without a job to page through"))
     dest = try
         destination_table(conn, job_project, job_id, job_location)
@@ -300,8 +362,7 @@ end
 """
     bq_query(con, sql; params, method, progress, ...) -> DataFrame
 
-Run a GoogleSQL query and return the whole result as a `DataFrame`, however
-large it is.
+Run a GoogleSQL query. Return the full result as a `DataFrame`, for all result sizes.
 
 ```julia
 df = bq_query(con, "SELECT name, SUM(number) AS n FROM `bigquery-public-data.usa_names.usa_1910_2013` GROUP BY name")
@@ -311,22 +372,27 @@ df = bq_query(con, "SELECT * FROM my_dataset.events WHERE day = @day AND country
 
 Keywords:
 
-* `params` — query parameters: a `NamedTuple`/`Dict` for `@name` placeholders,
-  a `Tuple`/`Vector` for `?` placeholders. See [`bq_param`](@ref) for explicit types.
-* `method` — how large results are downloaded. `:auto` (default) uses the
-  Storage Read API and falls back to REST paging if it is unavailable; `:arrow`
-  and `:rest` force one or the other.
-* `progress` — show a progress line for long downloads (default: in interactive sessions).
-* `max_streams` — parallel Storage API streams (default 8).
-* `compression` — Storage API compression: `:zstd` (default), `:lz4`, `:none`.
-* `concurrency`, `page_size` — parallel requests and rows per request for the REST path.
-* `dataset`, `location` — override the connection's defaults for this query.
-* `use_cache` — allow BigQuery's query cache (default `true`).
-* `max_bytes_billed` — fail instead of running a query that would bill more than this.
-* `labels` — job labels.
+* `params`: the query parameters. Use a `NamedTuple`/`Dict` for `@name`
+  placeholders, and a `Tuple`/`Vector` for `?` placeholders. For explicit types,
+  refer to [`bq_param`](@ref).
+* `method`: how the package downloads large results. `:auto` (the default) uses
+  the Storage Read API. If that API is not available, it uses REST pages. `:arrow`
+  and `:rest` select one of the two methods.
+* `progress`: show a progress line for long downloads (the default is true in
+  interactive sessions).
+* `max_streams`: the number of parallel Storage API streams (default 8).
+* `compression`: the Storage API compression: `:zstd` (default), `:lz4` or `:none`.
+* `concurrency`, `page_size`: the number of parallel requests, and the rows in
+  each request, for REST pages.
+* `dataset`, `location`: use these values for this query, not the defaults of the
+  connection.
+* `use_cache`: permit BigQuery to use its query cache (default `true`).
+* `max_bytes_billed`: if the query bills more than this, BigQuery does not run it.
+  The query fails.
+* `labels`: the job labels.
 
-Statements that return no rows (DDL, DML) give an empty `DataFrame`; use
-`DBInterface.execute` to get the number of affected rows.
+Statements that return no rows (DDL, DML) give an empty `DataFrame`. To get the
+number of affected rows, use `DBInterface.execute`.
 """
 bq_query(conn::Connection, sql::AbstractString; kwargs...) = to_dataframe(run_query(conn, sql; kwargs...))
 
@@ -335,16 +401,17 @@ quote_identifier(name::AbstractString) = "`" * replace(name, "`" => "\\`") * "`"
 """
     bq_read_table(con, table; columns, where, method, progress, ...) -> DataFrame
 
-Download a table directly, without running a query (and so without query
-cost when the Storage Read API or plain REST paging can be used).
+Download a table directly, without a query. If the package can use the Storage
+Read API or REST pages, there is no query cost.
 
 ```julia
 df = bq_read_table(con, "my-project.my_dataset.my_table")
 df = bq_read_table(con, "my_dataset.my_table"; columns = ["id", "amount"], where = "amount > 100")
 ```
 
-`columns` selects top-level columns; `where` is a SQL filter applied on the
-server. Views and external tables are read by running `SELECT ... FROM table`.
+`columns` selects top-level columns. The result has the columns in the sequence of
+`columns`. `where` is a SQL filter that the server applies. For views and external
+tables, the package runs `SELECT ... FROM table`.
 """
 function bq_read_table(conn::Connection, table::AbstractString;
                        columns = nothing,
@@ -361,19 +428,34 @@ function bq_read_table(conn::Connection, table::AbstractString;
     path = "projects/$(escapeuri(ref.project))/datasets/$(escapeuri(ref.dataset))/tables/$(escapeuri(ref.table))"
     meta = api_json(conn, "GET", path)
     fields = parse_schema(get(meta, "schema", nothing))
-    selected = String[]
+    wanted = String[]      # the columns in the sequence of the caller
+    selected = String[]    # the same columns in the sequence of the table schema
     if columns !== nothing
-        selected = String[string(c) for c in columns]
-        by_name = Dict(f.name => f for f in fields)
-        for name in selected
-            haskey(by_name, name) || throw(ArgumentError("table $ref has no column `$name`"))
+        wanted = String[string(c) for c in columns]
+        allunique(wanted) || throw(ArgumentError("`columns` names a column more than one time"))
+        position = Dict(f.name => i for (i, f) in enumerate(fields))
+        for name in wanted
+            haskey(position, name) || throw(ArgumentError("table $ref has no column `$name`"))
         end
-        fields = Field[by_name[name] for name in selected]
+        # Ask for the columns in the sequence of the table schema. tabledata.list
+        # returns the columns in that sequence, not in the sequence of the request.
+        # At the end, the result gets the sequence of `columns`.
+        selected = sort(wanted; by = name -> position[name])
+        fields = Field[fields[position[name]] for name in selected]
     end
     kind = uppercase(string(something(get(meta, "type", nothing), "TABLE")))
 
+    # Put the columns in the sequence of `columns`, then make the data frame.
+    function finish(cols, how::Symbol)
+        if !isempty(wanted)
+            perm = [findfirst(==(name), selected) for name in wanted]
+            return to_dataframe(make_result(fields[perm], cols[perm]; method = how))
+        end
+        return to_dataframe(make_result(fields, cols; method = how))
+    end
+
     via_query = function ()
-        select = isempty(selected) ? "*" : join(map(quote_identifier, selected), ", ")
+        select = isempty(wanted) ? "*" : join(map(quote_identifier, wanted), ", ")
         sql = "SELECT $select FROM `$(ref.project).$(ref.dataset).$(ref.table)`"
         where === nothing || (sql *= " WHERE " * where)
         return to_dataframe(run_query(conn, sql; method = method, max_streams = max_streams,
@@ -387,12 +469,12 @@ function bq_read_table(conn::Connection, table::AbstractString;
     try
         cols = try_arrow(conn, method, ref, fields; max_streams = max_streams, compression = compression,
                          selected_fields = selected, row_restriction = something(where, ""), progress = bar)
-        cols === nothing || return to_dataframe(make_result(fields, cols; method = :arrow))
+        cols === nothing || return finish(cols, :arrow)
     finally
         finish!(bar)
     end
 
-    # REST: tabledata.list cannot filter, so a `where` needs a query.
+    # REST: tabledata.list cannot apply a filter. Thus a `where` requires a query.
     where === nothing || return via_query()
     selected_param = isempty(selected) ? nothing : join(selected, ",")
     raw = api_call(conn, "GET", table_data_path(ref); query = [
@@ -416,5 +498,5 @@ function bq_read_table(conn::Connection, table::AbstractString;
     finally
         finish!(bar)
     end
-    return to_dataframe(make_result(fields, concat_chunks(chunks, length(fields)); method = :rest))
+    return finish(concat_chunks(chunks, length(fields)), :rest)
 end

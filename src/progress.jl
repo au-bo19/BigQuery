@@ -1,4 +1,4 @@
-# A one-line download progress indicator on stderr.
+# A progress indicator on one line of stderr.
 
 mutable struct Progress
     enabled::Bool
@@ -23,7 +23,7 @@ function advance!(p::Progress, n::Integer)
     done = Threads.atomic_add!(p.done, Int(n)) + n
     p.enabled || return nothing
     now = time()
-    # Stay quiet for quick downloads; afterwards refresh a few times a second.
+    # Show nothing for fast downloads. After that, update the line a few times each second.
     (now - p.started > 1.0 && now - p.last > 0.25) || return nothing
     if trylock(p.lock)
         try

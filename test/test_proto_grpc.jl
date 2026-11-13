@@ -1,4 +1,4 @@
-# Test-side protobuf encoders for the server's messages (the package only decodes these).
+# Protobuf encoders for the server messages, for the tests only (the package only decodes these messages).
 function encode_read_session(name, schema, streams, estimated_rows)
     io = IOBuffer()
     B.pb_string(io, 1, name)
@@ -16,7 +16,7 @@ end
 
 function encode_read_rows_response(batch, row_count)
     io = IOBuffer()
-    # A stats message first (field 2), as the real server sends: must be skipped.
+    # First a stats message (field 2), as the real server sends. The decoder must ignore it.
     B.pb_bytes(io, 2, UInt8[0x12, 0x09, 0x09, 0, 0, 0, 0, 0, 0, 0xe0, 0x3f])
     inner = IOBuffer()
     B.pb_bytes(inner, 1, batch)
@@ -26,7 +26,7 @@ function encode_read_rows_response(batch, row_count)
 end
 
 @testset "protobuf" begin
-    # Hand-assembled expectations, straight from the wire format spec.
+    # The expected bytes, written manually from the wire format specification.
     @test B.encode_read_rows("s", 0) == UInt8[0x0a, 0x01, 0x73]
     @test B.encode_read_rows("s", 300) == UInt8[0x0a, 0x01, 0x73, 0x10, 0xac, 0x02]
     @test B.encode_create_read_session("p", "t"; max_streams = 3, compression = :none) ==
@@ -56,11 +56,11 @@ end
     msg = encode_read_rows_response(batch, 4321)
     range, rows = B.decode_read_rows_response(msg)
     @test msg[range] == batch && rows == 4321
-    range, rows = B.decode_read_rows_response(UInt8[0x30, 0x00])     # no batch
+    range, rows = B.decode_read_rows_response(UInt8[0x30, 0x00])     # no record batch
     @test isempty(range)
-    @test_throws BigQueryError B.decode_read_rows_response(msg[1:end-10])   # truncated
+    @test_throws BigQueryError B.decode_read_rows_response(msg[1:end-10])   # the message is not complete
 
-    # Negative int64 values use the 10-byte varint form.
+    # Negative int64 values use the 10-byte varint format.
     io = IOBuffer()
     B.pb_int(io, 2, -1)
     @test take!(io) == vcat(UInt8[0x10], fill(0xff, 9), UInt8[0x01])
@@ -80,17 +80,17 @@ end
         @test isempty(sink.buf) && sink.error === nothing
     end
 
-    # An incomplete trailing message is left in the buffer (detected by the caller).
+    # A message that is not complete at the end stays in the buffer. The caller finds it.
     sink = B.GrpcSink(m -> nothing)
     write(sink, wire[1:end-1])
     @test !isempty(sink.buf)
 
-    # A failing consumer stops the stream and its error is kept.
+    # If the consumer fails, the stream stops, and the sink keeps the error.
     sink = B.GrpcSink(m -> error("boom"))
     write(sink, wire)
     @test sink.error isa ErrorException
     @test sink.interrupt.set
-    # Compressed messages were not negotiated.
+    # The client did not ask for compressed messages.
     sink = B.GrpcSink(m -> nothing)
     write(sink, UInt8[1, 0, 0, 0, 1, 9])
     @test sink.error isa B.GrpcError

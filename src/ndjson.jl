@@ -1,5 +1,5 @@
-# Preparing a table for upload: choosing BigQuery types for Julia columns and
-# encoding rows as newline-delimited JSON, the format sent to load jobs.
+# Prepare a table for upload: select BigQuery types for the Julia columns, and
+# encode the rows as newline-delimited JSON. Load jobs use this format.
 #
 #   Bool -> BOOL               Date     -> DATE
 #   Integer -> INT64           DateTime -> TIMESTAMP (taken as UTC)
@@ -8,19 +8,19 @@
 #   String, Symbol, Char -> STRING
 #   Vector{T} -> ARRAY<T>      NamedTuple -> STRUCT
 #
-# `missing` and `nothing` become NULL. This is the reverse of the mapping in
-# schema.jl, except where that one is not reversible: DATETIME and NUMERIC also
-# arrive as DateTime and Float64, so writing those types has to be asked for.
+# `missing` and `nothing` become NULL. This mapping is the opposite of the mapping
+# in schema.jl, but not fully. DATETIME and NUMERIC values also arrive as DateTime
+# and Float64. Thus, to write these two types, you must ask for them.
 
-"A column (or STRUCT field) of the table being written."
+"A column (or a STRUCT field) of the table that the package writes."
 struct WriteField
     name::String
-    type::String              # BigQuery type name, upper case
+    type::String              # the BigQuery type name, in upper case
     kind::Kind
     isjson::Bool
     repeated::Bool
     fields::Vector{WriteField}
-    # The REST definition to create the column with, when the user supplied one.
+    # The REST definition of the column, if the user gave one. The package makes the column with it.
     definition::Union{Nothing,Dict{String,Any}}
 end
 
@@ -30,7 +30,7 @@ function WriteField(name::AbstractString, type::AbstractString, repeated::Bool,
     return WriteField(String(name), t, kind_of(t), t == "JSON", repeated, fields, definition)
 end
 
-"A field from its REST description, as found in a table's schema."
+"A field from its REST description, as in the schema of a table."
 function WriteField(d::AbstractDict; definition = nothing)
     type = string(something(get(d, "type", nothing), "STRING"))
     mode = uppercase(string(something(get(d, "mode", nothing), "NULLABLE")))
@@ -48,7 +48,7 @@ describe(f::WriteField) = f.repeated ? "ARRAY<$(f.type)>" : f.type
 
 function schema_json(f::WriteField)
     f.definition === nothing || return f.definition
-    # The names the API itself uses when it describes a table.
+    # The type names that the API uses in its table descriptions.
     type = f.kind == K_INT ? "INTEGER" : f.kind == K_FLOAT ? "FLOAT" : f.kind == K_BOOL ? "BOOLEAN" :
            f.kind == K_RECORD ? "RECORD" : f.type
     d = Dict{String,Any}("name" => f.name, "type" => type, "mode" => f.repeated ? "REPEATED" : "NULLABLE")
@@ -56,7 +56,7 @@ function schema_json(f::WriteField)
     return d
 end
 
-# --- choosing types ---------------------------------------------------------
+# --- select types -----------------------------------------------------------
 
 strip_null(T::Type) = Base.nonnothingtype(nonmissingtype(T))
 
@@ -73,7 +73,7 @@ function scalar_type_name(T::Type)
     return nothing
 end
 
-"The field for values of Julia type `T`, or `nothing` when `T` does not determine one (`Any`, `Real`, ...)."
+"The field for values of the Julia type `T`. Returns `nothing` if `T` does not identify a field type (`Any`, `Real`, ...)."
 function infer_type(name::String, T::Type)
     T = strip_null(T)
     T === Union{} && return nothing
@@ -81,7 +81,7 @@ function infer_type(name::String, T::Type)
     scalar === nothing || return WriteField(name, scalar, false)
     if T <: AbstractVector
         el = infer_type(name, eltype(T))
-        (el === nothing || el.repeated) && return nothing     # BigQuery has no arrays of arrays
+        (el === nothing || el.repeated) && return nothing     # BigQuery has no arrays of arrays.
         return WriteField(name, el.type, true, el.fields)
     elseif T <: NamedTuple && isconcretetype(T) && fieldcount(T) > 0
         subs = WriteField[]
@@ -112,7 +112,7 @@ function merge_fields(a::WriteField, b::WriteField)
                         "convert it to a single type, or name its type with `types`"))
 end
 
-"The field that fits every value, for columns whose element type is too loose to say. `nothing` if all are NULL."
+"The field that agrees with all the values. Use it if the element type of the column is too general. Returns `nothing` if all values are NULL."
 function infer_values(name::String, values)
     by_type = Dict{DataType,Union{Nothing,WriteField}}()
     found = nothing
@@ -121,7 +121,7 @@ function infer_values(name::String, values)
         T = typeof(v)
         f = get!(() -> infer_type(name, T), by_type, T)
         if f === nothing
-            # The type alone does not say (a Vector{Any}, for example): look inside.
+            # The type does not identify the field (for example, a Vector{Any}). Examine the elements.
             v isa AbstractVector || cannot_infer(name, T)
             el = infer_values(name, v)
             el === nothing && continue
@@ -136,11 +136,11 @@ end
 function infer_column(name::String, col::AbstractVector)
     f = infer_type(name, eltype(col))
     f === nothing || return f
-    # A column of nothing but NULLs could be anything; STRING accepts later appends of any text.
+    # A column with only NULL values can have all types. STRING accepts all text in subsequent appends.
     return something(infer_values(name, col), WriteField(name, "STRING", false))
 end
 
-"A field from a user's type override: a type name, or a REST field description."
+"A field from a type that the user gives: a type name, or a REST field description."
 function field_from_spec(name::String, spec)
     if spec isa AbstractString
         t = uppercase(String(strip(spec)))
@@ -152,7 +152,7 @@ function field_from_spec(name::String, spec)
             "like Dict(\"type\" => \"NUMERIC\", \"precision\" => 10, \"scale\" => 2)"))
         return WriteField(name, t, repeated)
     elseif spec isa AbstractDict
-        d = Dict{String,Any}(JSON.parse(JSON.json(spec)))      # string keys all the way down
+        d = Dict{String,Any}(JSON.parse(JSON.json(spec)))      # string keys at all levels
         get(d, "type", nothing) isa AbstractString || throw(ArgumentError(
             "the description of column `$name` needs a \"type\" entry"))
         d["name"] = name
@@ -177,7 +177,7 @@ function infer_fields(names::Vector{String}, cols::Vector{AbstractVector}, types
                       for (n, c) in zip(names, cols)]
 end
 
-# --- encoding values --------------------------------------------------------
+# --- encode values ----------------------------------------------------------
 
 @noinline bad_value(f::WriteField, v) = throw(ArgumentError(
     "cannot write a value of type $(typeof(v)) to the $(describe(f)) column `$(f.name)`"))
@@ -226,7 +226,7 @@ end
 
 function write_date(io::IO, f::WriteField, v::Union{Date,DateTime})
     y, m, d = Dates.yearmonthday(v)
-    1 <= y <= 9999 || bad_value(f, v)          # the range BigQuery supports
+    1 <= y <= 9999 || bad_value(f, v)          # BigQuery supports only this range.
     write_padded(io, y, 4)
     write(io, UInt8('-'))
     write_padded(io, m, 2)
@@ -260,7 +260,7 @@ function write_time(io::IO, v::Time)
     return nothing
 end
 
-"`x` with `scale` decimal places and no exponent, trailing zeros dropped."
+"`x` with `scale` decimal places and no exponent. The function removes the zeros at the end."
 function fixed_decimal(x::Union{BigFloat,Rational}, scale::Int)
     n = round(BigInt, x * big(10)^scale)
     digits = string(abs(n))
@@ -271,7 +271,7 @@ function fixed_decimal(x::Union{BigFloat,Rational}, scale::Int)
     return n < 0 ? "-" * out : out
 end
 
-"Rewrite Julia's float notation without an exponent: \"1.5e6\" -> \"1500000\"."
+"Write the float notation of Julia without an exponent: \"1.5e6\" -> \"1500000\"."
 function plain_decimal(s::String)
     e = findfirst(==('e'), s)
     e === nothing && return s
@@ -281,15 +281,16 @@ function plain_decimal(s::String)
     negative && (mantissa = mantissa[2:end])
     dot = findfirst(==('.'), mantissa)
     digits = dot === nothing ? mantissa : mantissa[1:dot-1] * mantissa[dot+1:end]
-    point = (dot === nothing ? length(mantissa) : dot - 1) + exponent    # digits before the decimal point
+    point = (dot === nothing ? length(mantissa) : dot - 1) + exponent    # the digits before the decimal point
     out = point <= 0 ? "0." * "0"^(-point) * digits :
           point >= length(digits) ? digits * "0"^(point - length(digits)) :
           digits[1:point] * "." * digits[point+1:end]
     return negative ? "-" * out : out
 end
 
-# NUMERIC keeps 9 decimal places and BIGNUMERIC 38. Values are rounded to that
-# here, as a CAST would: a float such as 0.1 + 0.2 carries more digits than fit.
+# NUMERIC keeps 9 decimal places, and BIGNUMERIC keeps 38. This function rounds the
+# values to that number of places, as a CAST does. A float such as 0.1 + 0.2 has
+# more digits than the type keeps.
 function write_decimal(io::IO, f::WriteField, v)
     scale = f.kind == K_NUMERIC ? 9 : 38
     if v isa Bool
@@ -311,19 +312,58 @@ function write_decimal(io::IO, f::WriteField, v)
     return nothing
 end
 
-# A JSON column takes any JSON value. Text is taken to be a JSON document (which
-# is how this package returns JSON columns) and re-rendered onto a single line.
+# A JSON column accepts all JSON values. The package reads text as a JSON document,
+# because it also returns JSON columns as text. It writes the document again on one
+# line, and removes only the whitespace between the tokens. The numbers and the
+# strings do not change.
 function write_json_document(io::IO, f::WriteField, v)
     if v isa AbstractString
-        parsed = try
-            JSON.parse(v)
+        text = String(v)
+        valid = try
+            JSON.parse(text)
+            true
         catch
-            throw(ArgumentError("the JSON column `$(f.name)` was given text that is not valid JSON: " *
-                                first(v, 80)))
+            false
         end
-        write(io, JSON.json(parsed))
+        valid || throw(ArgumentError("the JSON column `$(f.name)` was given text that is not valid JSON: " *
+                                     first(text, 80)))
+        write_compact_json(io, text)
     else
         write(io, JSON.json(v))
+    end
+    return nothing
+end
+
+"""
+Write the JSON text `s` without the whitespace between the tokens. In strings,
+write control characters as escapes. Then the document is always on one line.
+"""
+function write_compact_json(io::IO, s::String)
+    instring = false
+    escaped = false
+    for b in codeunits(s)
+        if instring
+            if escaped
+                escaped = false
+                write(io, b)
+            elseif b == 0x5c
+                escaped = true
+                write(io, b)
+            elseif b == 0x22
+                instring = false
+                write(io, b)
+            elseif b < 0x20
+                write(io, "\\u00")
+                write(io, HEX_DIGITS[(b>>4)+1], HEX_DIGITS[(b&0x0f)+1])
+            else
+                write(io, b)
+            end
+        elseif b == 0x22
+            instring = true
+            write(io, b)
+        elseif !(b == 0x20 || b == 0x09 || b == 0x0a || b == 0x0d)
+            write(io, b)
+        end
     end
     return nothing
 end
@@ -344,7 +384,7 @@ function write_record(io::IO, f::WriteField, v)
     return nothing
 end
 
-"Write one value that is not an array. Branches on the value's type vanish when the column is typed."
+"Write one value that is not an array. If the column has a concrete type, the compiler removes the branches on the type of the value."
 function write_single(io::IO, f::WriteField, v)
     if is_null(v)
         write(io, "null")
@@ -369,8 +409,8 @@ function write_single(io::IO, f::WriteField, v)
         write(io, base64encode(v))
         write(io, 0x22)
     elseif v isa AbstractString
-        # Text for a column of another type is passed on for BigQuery to parse. That
-        # is the way to load exact NUMERIC values or timestamps with microseconds.
+        # Text for a column of a different type goes to BigQuery, and BigQuery parses it.
+        # Use text to load exact NUMERIC values or timestamps with microseconds.
         write_json_string(io, v)
     elseif k == K_INT
         if v isa Bool
@@ -418,17 +458,17 @@ function write_single(io::IO, f::WriteField, v)
     elseif k == K_NUMERIC || k == K_BIGNUMERIC
         write_decimal(io, f, v)
     else
-        bad_value(f, v)       # a type this package does not model: only text is accepted
+        bad_value(f, v)       # a type that this package does not model: accept only text
     end
     return nothing
 end
 
-"Write a value of field `f`, which may be an array."
+"Write a value of field `f`. The value can be an array."
 function write_value(io::IO, f::WriteField, v)
     if !f.repeated
         write_single(io, f, v)
     elseif is_null(v)
-        write(io, "[]")       # an array cannot be NULL in BigQuery, only empty
+        write(io, "[]")       # In BigQuery, an array cannot be NULL. It can only be empty.
     else
         v isa AbstractVector || bad_value(f, v)
         write(io, UInt8('['))
@@ -443,11 +483,11 @@ function write_value(io::IO, f::WriteField, v)
     return nothing
 end
 
-# --- encoding rows ----------------------------------------------------------
+# --- encode rows ------------------------------------------------------------
 
-"One column ready for encoding. The column's type is a parameter, so each cell is written without dynamic dispatch."
+"One column, ready to encode. The type of the column is a type parameter. Thus the package writes each cell without dynamic dispatch."
 struct ColumnEncoder{C<:AbstractVector}
-    key::String               # `"name":`, already rendered
+    key::String               # `"name":`, as text that is ready to write
     field::WriteField
     col::C
 end
@@ -469,7 +509,7 @@ write_cells(io::IO, ::Tuple{}, i::Int) = nothing
     return write_cells(io, rest, i)
 end
 
-# Very wide tables: a tuple that long would take ages to compile.
+# Very wide tables: the compiler takes a very long time for a tuple of that length.
 function write_cells(io::IO, encoders::Vector{Any}, i::Int)
     for (j, e) in enumerate(encoders)
         j > 1 && write(io, UInt8(','))

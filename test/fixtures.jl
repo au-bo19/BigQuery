@@ -1,5 +1,5 @@
-# Test data: one "truth" table, plus independent encoders that render it the
-# way BigQuery does on each of its two wire formats (REST JSON and Arrow).
+# Test data: one "truth" table, and independent encoders. The encoders write the
+# table as BigQuery does in its two wire formats (REST JSON and Arrow).
 
 module Fixtures
 
@@ -28,7 +28,7 @@ const SCHEMA = Dict{String,Any}("fields" => Any[
 
 const NAMES = ["plain", "with \"quotes\"", "tab\tand\nnewline", "ünïcödé", "emoji 😀", "back\\slash", "", "</script>"]
 
-"The expected Julia columns for `n` rows, as BigQuery.jl should return them."
+"The Julia columns that BigQuery.jl must return for `n` rows."
 function truth_table(n::Integer)
     ts0 = DateTime(2020, 1, 1)
     id = collect(Int64, 1:n)
@@ -58,7 +58,7 @@ function rest_scalar(x, typ::String)
     typ == "NUMERIC" && return string(x)
     typ == "BOOLEAN" && return x ? "true" : "false"
     typ == "STRING" && return x
-    typ == "TIMESTAMP" && return string(unix_micros(x) + 456)   # sub-millisecond part is truncated
+    typ == "TIMESTAMP" && return string(unix_micros(x) + 456)   # the package removes the part below one millisecond
     typ == "DATE" && return Dates.format(x, dateformat"yyyy-mm-dd")
     typ == "DATETIME" && return Dates.format(x, dateformat"yyyy-mm-ddTHH:MM:SS.sss") * "000"
     typ == "TIME" && return Dates.format(x, dateformat"HH:MM:SS.sss") *
@@ -82,7 +82,7 @@ function rest_value(x, field::AbstractDict)
     end
 end
 
-"Render a table as BigQuery REST rows: one JSON string `{\"f\":[{\"v\":...},...]}` per row."
+"Write a table as BigQuery REST rows: one JSON string `{\"f\":[{\"v\":...},...]}` for each row."
 function rest_rows(table, schema = SCHEMA)
     fields = schema["fields"]
     cols = collect(values(table))
@@ -112,7 +112,7 @@ function arrow_columns(table)
         x = table.x,
         name = table.name,
         flag = table.flag,
-        ts = [lift(v -> ArrowTS(unix_micros(v) + 456), v) for v in table.ts],   # sub-millisecond part is truncated
+        ts = [lift(v -> ArrowTS(unix_micros(v) + 456), v) for v in table.ts],   # the package removes the part below one millisecond
         d = table.d,
         dt = [ArrowDT(unix_micros(v)) for v in table.dt],
         t = [ArrowTime(Dates.value(v) ÷ 1000) for v in table.t],
@@ -126,8 +126,8 @@ end
 rows_of(cols, range) = map(c -> c[range], cols)
 
 """
-Serialize a table the way the Storage Read API does: one schema message and
-one record batch message per element of `ranges`.
+Serialize a table as the Storage Read API does: one schema message, and one record
+batch message for each element of `ranges`.
 """
 function arrow_messages(cols, ranges; compress = nothing)
     schema = UInt8[]
@@ -136,8 +136,8 @@ function arrow_messages(cols, ranges; compress = nothing)
         io = IOBuffer()
         Arrow.write(io, rows_of(cols, r); compress = compress)
         bytes = take!(io)
-        # Stream layout: [schema message][record batch message][8-byte end marker].
-        # A schema message is 0xFFFFFFFF, an int32 metadata length, then the metadata.
+        # The stream layout: [schema message][record batch message][8-byte end marker].
+        # A schema message is 0xFFFFFFFF, an int32 metadata length, and then the metadata.
         meta_len = Int(reinterpret(Int32, bytes[5:8])[1])
         schema = bytes[1:8+meta_len]
         push!(batches, bytes[9+meta_len:end-8])

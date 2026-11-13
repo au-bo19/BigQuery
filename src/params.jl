@@ -3,9 +3,9 @@
 """
     bq_param(value, type)
 
-A query parameter with an explicit BigQuery type, for when the type cannot be
-inferred from the Julia value: a `missing`, an empty array, or a `DateTime`
-that should be sent as `DATETIME` rather than the default `TIMESTAMP`.
+A query parameter with an explicit BigQuery type. Use it if the package cannot find
+the type from the Julia value: a `missing`, an empty array, or a `DateTime` for a
+`DATETIME` parameter (the default type is `TIMESTAMP`).
 
 ```julia
 bq_query(con, "SELECT @d AS d, @x AS x"; params = (d = bq_param(now(), "DATETIME"), x = bq_param(missing, "INT64")))
@@ -86,7 +86,7 @@ function param_json(x)
                             "parameterValue" => Dict{String,Any}("value" => param_string(x, type)))
 end
 
-"Returns `(mode, parameters)` for the jobs.query request, or `nothing` without parameters."
+"Returns `(mode, parameters)` for the jobs.query request, or `nothing` if there are no parameters."
 function encode_params(params)
     params === nothing && return nothing
     named = params isa NamedTuple || params isa AbstractDict ||

@@ -1,13 +1,13 @@
-# Tests against the real services. Off by default.
+# Tests against the real services. These tests do not run by default.
 #
-#   BIGQUERY_NETWORK_TESTS=1   reach Google's endpoints without credentials and
-#                              check that they answer the way the client expects.
-#   BIGQUERY_TEST_PROJECT=...  run real queries, billed to that project (a few
-#                              MB at most), using your default credentials.
+#   BIGQUERY_NETWORK_TESTS=1   connect to the Google endpoints without credentials, and
+#                              make sure that their responses agree with the client.
+#   BIGQUERY_TEST_PROJECT=...  run real queries with your default credentials. BigQuery
+#                              bills them to that project (a few MB maximum).
 
 if get(ENV, "BIGQUERY_NETWORK_TESTS", "") != ""
     @testset "live endpoints, no credentials" begin
-        # An existing project: requests naming a made-up one are rejected before authentication.
+        # A project that exists. Google refuses requests for an invented project before the authentication.
         con = bq_connect("bigquery-public-data"; token = "not-a-real-token", max_retries = 0)
         err = try
             bq_query(con, "SELECT 1")
@@ -15,7 +15,7 @@ if get(ENV, "BIGQUERY_NETWORK_TESTS", "") != ""
             e
         end
         @test err isa BigQueryError && err.status == 401
-        # gRPC over HTTP/2 through this machine's network stack, status read from trailers.
+        # gRPC over HTTP/2 through the network stack of this computer. The status comes from the trailers.
         err = try
             B.create_read_session(con, B.TableRef("bigquery-public-data", "usa_names", "usa_1910_2013");
                                   max_streams = 1, compression = :zstd)
@@ -72,14 +72,14 @@ if get(ENV, "BIGQUERY_TEST_PROJECT", "") != ""
         @test small.geo[1] == "POINT(1 2)"
         @test all(ismissing, small.nothing_here)
 
-        # A result big enough for the bulk paths; both must agree exactly.
+        # A result that is sufficiently large for the bulk procedures. The two results must be the same.
         n = 300_000
         rest = B.run_query(con, types_sql(n); method = :rest)
         @test rest.method == :rest && rest.total_rows == n
         arrow = B.run_query(con, types_sql(n); method = :arrow)
         @test arrow.method == :arrow && arrow.total_rows == n
         df_rest, df_arrow = DataFrame(rest), DataFrame(arrow)
-        @test df_rest.id == 1:n && df_arrow.id == 1:n            # ORDER BY is preserved
+        @test df_rest.id == 1:n && df_arrow.id == 1:n            # the ORDER BY sequence does not change
         for name in names(df_rest)
             @test typeof(df_rest[!, name]) == typeof(df_arrow[!, name])
             @test isequal(df_rest[!, name], df_arrow[!, name])
@@ -94,12 +94,26 @@ if get(ENV, "BIGQUERY_TEST_PROJECT", "") != ""
                                columns = ["name", "number"], where = "state = 'RI' AND year = 2000")
         @test nrow(public) > 100 && names(public) == ["name", "number"] && eltype(public.number) == Int64
 
+        # Columns in a sequence that is different from the schema sequence (word, word_count,
+        # corpus, corpus_date), through each download procedure. The table has two STRING
+        # columns and two INTEGER columns. The values must stay with the correct column names.
+        for method in (:rest, :arrow)
+            reversed = bq_read_table(con, "bigquery-public-data.samples.shakespeare";
+                                     columns = ["corpus_date", "corpus", "word_count", "word"],
+                                     method = method, progress = false)
+            @test names(reversed) == ["corpus_date", "corpus", "word_count", "word"]
+            @test nrow(reversed) > 100_000
+            @test all(y -> y == 0 || 1500 < y < 1700, reversed.corpus_date)      # years, not word counts
+            @test length(unique(reversed.corpus)) < 50                           # play names, not words
+            @test count(==("hamlet"), reversed.corpus) > 1000
+        end
+
         @test_throws BigQueryError bq_query(con, "SELEC 1")
         @test bq_query(con, "SELECT @a + 1 AS b, @names AS names"; params = (a = 41, names = ["x", "y"])).b == [42]
     end
 
-    # Uploads need somewhere to write: a dataset you can create tables in. One
-    # table is created there and dropped again.
+    # The upload tests must have a dataset in which you can make tables. The tests make
+    # one table there, and then remove it.
     if get(ENV, "BIGQUERY_TEST_DATASET", "") == ""
         @info "live upload tests skipped: set BIGQUERY_TEST_DATASET to a dataset you can create tables in"
     else
@@ -111,7 +125,7 @@ if get(ENV, "BIGQUERY_TEST_PROJECT", "") != ""
             truth = truth_table(n)
             extra = (
                 odd = Float64[i % 4 == 0 ? NaN : i % 4 == 1 ? Inf : i % 4 == 2 ? -Inf : i * 1.0e300 for i in 1:n],
-                money = Float64[i % 2 == 0 ? i * 1.5e6 : i * 1.0e-7 for i in 1:n],       # printed with an exponent
+                money = Float64[i % 2 == 0 ? i * 1.5e6 : i * 1.0e-7 for i in 1:n],       # Julia prints these with an exponent
                 bignum = BigFloat[parse(BigFloat, "$(i)234567890123456789.$(i)23456789") for i in 1:n],
                 exact = String["$i.123456789" for i in 1:n],
                 js = Union{Missing,String}[i % 3 == 0 ? missing : "{\"a\": $i, \"b\": [\"x\", null]}" for i in 1:n],
@@ -129,7 +143,7 @@ if get(ENV, "BIGQUERY_TEST_PROJECT", "") != ""
 
                 back = bq_query(con, "SELECT * FROM $sql_name ORDER BY id")
                 @test nrow(back) == n
-                for name in keys(truth)                 # every type comes back as it went in
+                for name in keys(truth)                 # each type comes back without a change
                     @test isequal(back[!, name], narrow(truth[name]))
                 end
                 @test isequal(back.odd, extra.odd)
@@ -147,7 +161,7 @@ if get(ENV, "BIGQUERY_TEST_PROJECT", "") != ""
                 @test kind["bignum"] == "BIGNUMERIC" && kind["js"] == "JSON" && kind["tags"] == "ARRAY<STRING>"
                 @test kind["exact"] == "NUMERIC" && kind["by"] == "BYTES" && startswith(kind["st"], "STRUCT<")
 
-                # What was read can be appended as it is: the table's schema decides how it is written.
+                # You can append the data that you read without a change. The schema of the table controls how the package writes it.
                 @test_throws BigQueryError bq_write_table(con, table, back)
                 @test bq_write_table(con, table, back; if_exists = :append).rows == n
                 @test bq_query(con, "SELECT COUNT(*) AS c, COUNT(DISTINCT id) AS d FROM $sql_name") ==
@@ -155,7 +169,7 @@ if get(ENV, "BIGQUERY_TEST_PROJECT", "") != ""
                 twice = bq_query(con, "SELECT * FROM $sql_name WHERE id <= 5 ORDER BY id")
                 @test isequal(twice[1:2:end, :], twice[2:2:end, :])
 
-                # A row BigQuery rejects: nothing is added, and the error says why.
+                # A row that BigQuery refuses: BigQuery adds nothing, and the error shows why.
                 err = try
                     bq_write_table(con, table, (id = ["1", "not a number"],); if_exists = :append)
                 catch e
@@ -165,7 +179,7 @@ if get(ENV, "BIGQUERY_TEST_PROJECT", "") != ""
                 @info "a rejected upload reads" err
                 @test bq_query(con, "SELECT COUNT(*) AS c FROM $sql_name").c == [2n]
 
-                # Uploads are gzipped unless asked otherwise; this one is not.
+                # Uploads use gzip, if the caller does not ask for a different behaviour. This upload does not use gzip.
                 @test bq_write_table(con, table, (a = [1, 2, 3], b = ["x", missing, "z"]); if_exists = :replace,
                                      compress = false).rows == 3
                 small = bq_query(con, "SELECT * FROM $sql_name ORDER BY a")
@@ -174,8 +188,8 @@ if get(ENV, "BIGQUERY_TEST_PROJECT", "") != ""
                 @test bq_write_table(con, table, (a = Int[], b = String[]); if_exists = :replace).rows == 0
                 @test size(bq_read_table(con, table)) == (0, 2)
 
-                # Enough rows for the upload to take several requests, compressed and not.
-                m = 600_000                             # about 19 MB of JSON, a few MB gzipped
+                # Sufficient rows for an upload of a number of requests, with and without compression.
+                m = 600_000                             # approximately 19 MB of JSON, a few MB with gzip
                 big = (id = collect(1:m), s = [string("row ", i) for i in 1:m])
                 chunk = B.UPLOAD_CHUNK_BYTES[]
                 try

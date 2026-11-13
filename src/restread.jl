@@ -1,15 +1,15 @@
-# Fallback path: page through results with the REST API (tabledata.list),
-# fetching and decoding several pages concurrently. Needs no extra permissions
-# beyond those required to run the query.
+# The alternative procedure: read the result page by page with the REST API
+# (tabledata.list). The package gets and decodes a number of pages at the same
+# time. This procedure uses only the permissions that the query uses.
 
-const REST_TARGET_PAGE_BYTES = 8 * 1024 * 1024    # responses are capped at 10 MB
+const REST_TARGET_PAGE_BYTES = 8 * 1024 * 1024    # the maximum response size is 10 MB
 const REST_MAX_PAGE_ROWS = 50_000
 const REST_MIN_PAGE_ROWS = 100
 
 table_data_path(t::TableRef) =
     "projects/$(escapeuri(t.project))/datasets/$(escapeuri(t.dataset))/tables/$(escapeuri(t.table))/data"
 
-"Rows `start .. start+count-1` (0-based) of a table, as a chunk of columns."
+"The rows `start .. start+count-1` (0-based) of a table, as a chunk of columns."
 function fetch_table_chunk(conn::Connection, table::TableRef, fields::Vector{Field},
                            start::Int, count::Int, selected::Union{Nothing,String}, progress::Progress)
     cols = new_columns(fields)
@@ -24,8 +24,8 @@ function fetch_table_chunk(conn::Connection, table::TableRef, fields::Vector{Fie
         s = String(raw)
         range = get(top_level_spans(s), "rows", nothing)
         m = range === nothing ? 0 : decode_rows!(cols, fields, s, range)
-        # The server returns fewer rows than asked when a page would exceed its
-        # size cap; keep going until this chunk is complete.
+        # If a page is larger than the size limit of the server, the server returns
+        # fewer rows than requested. Continue until this chunk is complete.
         m == 0 && throw(BigQueryError(
             "BigQuery returned no rows at offset $(start + got) of $(table); expected $(count - got) more"))
         got += m
@@ -41,8 +41,11 @@ function rows_per_page(bytes_per_row::Real, page_size::Union{Nothing,Integer})
 end
 
 """
-Download rows `start .. total-1` of `table` with `concurrency` parallel page
-requests, returning the chunks in row order.
+Download the rows `start .. total-1` of `table` with `concurrency` parallel page
+requests. Return the chunks in the row sequence.
+
+If this task stops (for example, because the user pushes Ctrl-C), the workers stop
+after their current page.
 """
 function read_table_rest(conn::Connection, table::TableRef, fields::Vector{Field}, total::Int;
                          start::Int = 0, bytes_per_row::Real = 0, concurrency::Integer = 8,
@@ -57,32 +60,39 @@ function read_table_rest(conn::Connection, table::TableRef, fields::Vector{Field
     next = Threads.Atomic{Int}(1)
     failure = Ref{Any}(nothing)
     failure_lock = ReentrantLock()
-    @sync for _ in 1:min(Int(concurrency), nchunks)
-        Threads.@spawn begin
-            while failure[] === nothing
-                k = Threads.atomic_add!(next, 1)
-                k > nchunks && break
-                chunk_start = start + (k - 1) * per_page
-                count = min(per_page, total - chunk_start)
-                try
-                    chunks[k] = fetch_table_chunk(conn, table, fields, chunk_start, count, selected, progress)
-                catch e
-                    lock(failure_lock) do
-                        failure[] === nothing && (failure[] = e)
+    record_failure(e) = lock(() -> (failure[] === nothing && (failure[] = e)), failure_lock)
+    try
+        @sync for _ in 1:min(Int(concurrency), nchunks)
+            Threads.@spawn begin
+                while failure[] === nothing
+                    k = Threads.atomic_add!(next, 1)
+                    k > nchunks && break
+                    chunk_start = start + (k - 1) * per_page
+                    count = min(per_page, total - chunk_start)
+                    try
+                        chunks[k] = fetch_table_chunk(conn, table, fields, chunk_start, count, selected, progress)
+                    catch e
+                        record_failure(e)
+                        break
                     end
-                    break
                 end
             end
         end
+    catch e
+        # An interrupt stops this task, but not the workers. Record the interrupt
+        # as a failure. Then the workers stop before they get the next page.
+        record_failure(e)
+        rethrow()
     end
     failure[] === nothing || throw(failure[])
     return chunks
 end
 
 """
-Page through a query's results with jobs.getQueryResults. Sequential (each page
-needs the previous page's token); only used when a job has no destination
-table to read from, as with scripts.
+Read the pages of a query result with jobs.getQueryResults. The function reads the
+pages one after the other, because each request must have the token from the
+previous page. The package uses this function only if a job has no destination
+table, for example a script.
 """
 function read_query_pages(conn::Connection, project::String, job_id::String,
                           location::Union{Nothing,String}, fields::Vector{Field},

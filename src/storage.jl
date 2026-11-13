@@ -1,5 +1,5 @@
-# Fast path: the BigQuery Storage Read API. Rows come back as Arrow record
-# batches over several parallel gRPC streams.
+# The fast procedure: the BigQuery Storage Read API. The rows come as Arrow record
+# batches over a number of parallel gRPC streams.
 
 struct TableRef
     project::String
@@ -12,8 +12,8 @@ Base.show(io::IO, t::TableRef) = print(io, t.project, ".", t.dataset, ".", t.tab
 
 const STORAGE_SERVICE = "/google.cloud.bigquery.storage.v1.BigQueryRead/"
 
-# Decode buffered record batches once this many bytes have accumulated, so raw
-# and decoded data never both exist in full.
+# When the record batches in the buffer reach this size, decode them. Thus the raw
+# data and the decoded data are never both in memory in full.
 const ARROW_FLUSH_BYTES = 32 * 1024 * 1024
 
 function create_read_session(conn::Connection, table::TableRef; max_streams::Integer,
@@ -31,7 +31,7 @@ function create_read_session(conn::Connection, table::TableRef; max_streams::Int
         response = Ref{Union{Nothing,Vector{UInt8}}}(nothing)
         try
             grpc_call(msg -> (response[] = msg), conn.downloader, url, access_token(conn), request;
-                      routing = routing)
+                      routing = routing, user_project = user_project(conn))
             response[] === nothing && throw(GrpcError(13, "CreateReadSession returned no message"))
             return decode_read_session(response[])
         catch e
@@ -41,8 +41,8 @@ function create_read_session(conn::Connection, table::TableRef; max_streams::Int
                 reauthed = true
                 continue
             end
-            # Few retries here: when the Storage API is unreachable (firewall,
-            # proxy) the caller should get to the REST fallback quickly.
+            # Only a small number of attempts here. If the Storage API is not available
+            # (firewall, proxy), the caller must get to the REST procedure quickly.
             (grpc_retryable(e) && attempt <= min(conn.max_retries, 2)) || rethrow()
             sleep(retry_delay(attempt))
         end
@@ -50,8 +50,9 @@ function create_read_session(conn::Connection, table::TableRef; max_streams::Int
 end
 
 """
-Read one stream to its end, returning a vector of decoded chunks
-`(names, columns)`. A dropped stream is resumed from the last row received.
+Read one stream to its end. Return a vector of decoded chunks `(names, columns)`.
+If the stream stops too early, the function starts it again from the last row that
+it received.
 """
 function read_stream(conn::Connection, stream::String, schema::Vector{UInt8},
                      progress::Progress, cancel::CancelGroup)
@@ -82,13 +83,15 @@ function read_stream(conn::Connection, stream::String, schema::Vector{UInt8},
 
     url = conn.storage_endpoint * STORAGE_SERVICE * "ReadRows"
     routing = "read_stream=" * escapeuri(stream)
+    project = user_project(conn)
     failures = 0
     reauthed = false
     while true
         before = offset
         try
             grpc_call(on_message, conn.downloader, url, access_token(conn),
-                      encode_read_rows(stream, offset); routing = routing, cancel = cancel)
+                      encode_read_rows(stream, offset); routing = routing,
+                      user_project = project, cancel = cancel)
             break
         catch e
             e isa GrpcError || rethrow()
@@ -97,7 +100,7 @@ function read_stream(conn::Connection, stream::String, schema::Vector{UInt8},
                 reauthed = true
                 continue
             end
-            failures = offset > before ? 1 : failures + 1    # progress resets the budget
+            failures = offset > before ? 1 : failures + 1    # after progress, the count starts again
             (grpc_retryable(e) && failures <= conn.max_retries) || rethrow()
             sleep(retry_delay(failures))
         end
@@ -110,9 +113,9 @@ unwrap_task_error(e) = e isa TaskFailedException ? unwrap_task_error(e.task.exce
                        (e isa CompositeException && !isempty(e.exceptions)) ? unwrap_task_error(first(e.exceptions)) : e
 
 """
-Download `table` through the Storage Read API and return its columns in the
-order of `fields`. `ordered = true` uses a single stream so that the table's
-row order (an `ORDER BY` result) is preserved.
+Download `table` through the Storage Read API. Return its columns in the sequence
+of `fields`. With `ordered = true`, the function uses one stream. This keeps the
+row sequence of the table (the result of an `ORDER BY`).
 """
 function read_table_arrow(conn::Connection, table::TableRef, fields::Vector{Field};
                           ordered::Bool = false, max_streams::Integer = 8,
@@ -122,14 +125,14 @@ function read_table_arrow(conn::Connection, table::TableRef, fields::Vector{Fiel
     session = create_read_session(conn, table;
         max_streams = ordered ? 1 : max_streams, compression = compression,
         selected_fields = selected_fields, row_restriction = row_restriction)
-    isempty(session.streams) && return new_columns(fields)   # nothing to read
+    isempty(session.streams) && return new_columns(fields)   # there is no data to read
 
     cancel = CancelGroup()
     tasks = map(session.streams) do stream
         Threads.@spawn try
             read_stream(conn, stream, session.arrow_schema, progress, cancel)
         catch
-            cancel!(cancel)      # one stream failed: stop the others right away
+            cancel!(cancel)      # one stream failed: stop the other streams immediately
             rethrow()
         end
     end
@@ -139,7 +142,7 @@ function read_table_arrow(conn::Connection, table::TableRef, fields::Vector{Fiel
         try
             results[k] = fetch(task)
         catch e
-            # Remember the first real error, stop the other streams, keep draining.
+            # Keep the first real error, stop the other streams, and wait for all the tasks.
             if failure === nothing || (failure isa GrpcError && failure.code == 1)
                 failure = unwrap_task_error(e)
             end

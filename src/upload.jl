@@ -1,24 +1,24 @@
-# Writing a table. The rows are encoded as newline-delimited JSON, gzipped, and
-# handed to a load job through a resumable upload, a chunk at a time, so the
-# encoded data never exists in full. Load jobs cost nothing and are atomic: the
-# table changes only if every row was accepted.
+# Write a table. The package encodes the rows as newline-delimited JSON and
+# compresses them with gzip. A resumable upload gives the rows to a load job, one
+# chunk at a time. Thus the full encoded data is never in memory. Load jobs are
+# free and atomic: the table changes only if BigQuery accepts all the rows.
 
-# Bytes sent per request. Chunks other than the last must be a multiple of 256 KiB.
+# The bytes in each request. All chunks except the last must be a multiple of 256 KiB.
 const UPLOAD_CHUNK_UNIT = 256 * 1024
 const UPLOAD_CHUNK_BYTES = Ref(8 * 1024 * 1024)
 
-# BigQuery loads a gzip file of at most 4 GB (an uncompressed one may be 5 TB).
-# A table that would compress to more than that is uploaded as it is.
+# BigQuery loads a gzip file of 4 GB maximum (an uncompressed file can be 5 TB).
+# If a table is larger than that after compression, the package uploads it without compression.
 const GZIP_LIMIT_BYTES = Ref(4_000_000_000)
 const GZIP_SAMPLE_ROWS = 2_000
-const GZIP_BATCH_BYTES = 1024 * 1024      # encoded rows handed to zlib at a time
+const GZIP_BATCH_BYTES = 1024 * 1024      # the encoded rows that zlib gets at one time
 
 const WRITE_DISPOSITIONS = Dict(:fail => "WRITE_EMPTY", :append => "WRITE_APPEND", :replace => "WRITE_TRUNCATE")
 
 table_meta_path(t::TableRef) =
     "projects/$(escapeuri(t.project))/datasets/$(escapeuri(t.dataset))/tables/$(escapeuri(t.table))"
 
-"The names and columns of any Tables.jl table."
+"The names and columns of a Tables.jl table."
 function table_columns(data)
     Tables.istable(data) || throw(ArgumentError(
         "the data to upload must be a table (a DataFrame, or anything else that implements Tables.jl), " *
@@ -37,12 +37,20 @@ function table_columns(data)
     return names, cols
 end
 
-"The columns of an existing table, or `nothing` if there is no such table."
+"""
+The columns of an existing table, or `nothing` if the table does not exist.
+
+If the dataset does not exist, the function throws an error. Then the package
+does not send the rows, because the load job can only fail.
+"""
 function existing_fields(conn::Connection, table::TableRef)
     meta = try
         api_json(conn, "GET", table_meta_path(table))
     catch e
         (e isa BigQueryError && e.status == 404) || rethrow()
+        # BigQuery says "Not found: Dataset ..." if the dataset does not exist.
+        startswith(lowercase(e.message), "not found: dataset") && throw(BigQueryError(
+            "cannot write to $table: " * e.message * "; create the dataset first", e.reason, e.status))
         return nothing
     end
     schema = get(meta, "schema", nothing)
@@ -50,7 +58,7 @@ function existing_fields(conn::Connection, table::TableRef)
     return raw isa AbstractVector ? WriteField[WriteField(x) for x in raw] : WriteField[]
 end
 
-"Pair each column of the data with the table column it goes to. BigQuery column names ignore case."
+"Find the table column for each column of the data. BigQuery column names are not case-sensitive."
 function match_columns(table::TableRef, names::Vector{String}, table_fields::Vector{WriteField})
     exact = Dict(f.name => f for f in table_fields)
     folded = Dict(lowercase(f.name) => f for f in table_fields)
@@ -71,7 +79,7 @@ end
 mutable struct UploadSession
     conn::Connection
     url::String
-    offset::Int               # bytes the server has confirmed
+    offset::Int               # the bytes that the server has confirmed
 end
 
 function start_upload(conn::Connection, job::AbstractDict)
@@ -84,7 +92,7 @@ function start_upload(conn::Connection, job::AbstractDict)
     return UploadSession(conn, String(location), 0)
 end
 
-"How many bytes the server holds, from the `Range: bytes=0-N` header of a 308 answer."
+"The number of bytes that the server holds, from the `Range: bytes=0-N` header of a 308 response."
 function confirmed_bytes(resp::HTTPResponse)
     range = header_value(resp.headers, "range")
     range === nothing && return 0
@@ -94,13 +102,13 @@ function confirmed_bytes(resp::HTTPResponse)
 end
 
 """
-Upload `data` as the bytes following `session.offset`. `total` is the size of
-the whole upload when `data` is its last part, otherwise `nothing`. Returns the
-job the server created once the upload is complete, `nothing` before that.
+Upload `data` as the bytes after `session.offset`. If `data` is the last part,
+`total` is the size of the full upload. If not, `total` is `nothing`. Return the job
+from the server when the upload is complete, and `nothing` before that.
 
-The server may keep only part of what a request carried, and a request can fail
-after its bytes were stored. So every answer is read for the position the server
-has reached, and after a failure that position is asked for before resending.
+The server can keep only a part of the bytes of a request. Also, a request can fail
+after the server stored its bytes. Thus the function reads the server position from
+each response. After a failure, it asks for that position before it sends again.
 """
 function send_chunk!(session::UploadSession, data::Vector{UInt8}, total::Union{Nothing,Int})
     conn = session.conn
@@ -112,12 +120,9 @@ function send_chunk!(session::UploadSession, data::Vector{UInt8}, total::Union{N
     while true
         start = session.offset
         body = probe ? UInt8[] : start == stop - length(data) ? data : data[end-(stop-start)+1:end]
-        headers = Pair{String,String}[
-            "Authorization" => "Bearer " * access_token(conn),
-            "User-Agent" => USER_AGENT,
-            "Content-Type" => "application/octet-stream",
-            "Content-Range" => isempty(body) ? "bytes */$size" : "bytes $start-$(stop - 1)/$size",
-        ]
+        headers = auth_headers(conn)
+        push!(headers, "Content-Type" => "application/octet-stream",
+                       "Content-Range" => isempty(body) ? "bytes */$size" : "bytes $start-$(stop - 1)/$size")
         resp = try
             http_request(conn.downloader, "PUT", session.url; headers = headers, body = body, timeout = 3600)
         catch e
@@ -139,7 +144,7 @@ function send_chunk!(session::UploadSession, data::Vector{UInt8}, total::Union{N
             session.offset = confirmed
             (confirmed == stop && total === nothing) && return nothing
             if !probe && confirmed == start
-                # Nothing was taken (or the finished upload was not acknowledged).
+                # The server kept nothing (or did not reply to the completed upload).
                 failures += 1
                 failures > conn.max_retries && throw(BigQueryError("the upload to BigQuery is not making progress"))
                 sleep(retry_delay(failures))
@@ -160,14 +165,18 @@ function send_chunk!(session::UploadSession, data::Vector{UInt8}, total::Union{N
     end
 end
 
-"The rows whose compressed size stands for the whole table's: evenly spread, so sorted data does not mislead."
+"""
+The rows that give an estimate of the compressed size of the full table. The rows
+are evenly distributed. Thus sorted data does not give a wrong estimate.
+"""
 sample_rows(nrows::Int) =
     nrows <= GZIP_SAMPLE_ROWS ? collect(1:nrows) : round.(Int, range(1, nrows; length = GZIP_SAMPLE_ROWS))
 
 """
-Whether the table can be uploaded gzipped, judged by compressing a sample of
-its rows. Rows far apart have less in common than neighbours, so the estimate
-errs on the large side; a quarter of the limit is kept in hand all the same.
+Return true if the table can go as a gzip upload. To find this, the function
+compresses a sample of the rows. Rows that are far apart have less in common than
+adjacent rows, thus the estimate is usually too large. The function also keeps a
+margin of a quarter of the limit.
 """
 function gzip_fits(encoders, nrows::Int)
     sample = sample_rows(nrows)
@@ -179,7 +188,7 @@ function gzip_fits(encoders, nrows::Int)
     return estimate <= 0.75 * GZIP_LIMIT_BYTES[]
 end
 
-"Send the whole chunks that `io` holds and keep the rest, so that something is always left for the final request."
+"Send the full chunks in `io` and keep the remainder. Thus some data always remains for the final request."
 function send_full_chunks!(session::UploadSession, io::IOBuffer, chunk::Int)
     position(io) > chunk || return nothing
     data = take!(io)
@@ -193,16 +202,17 @@ function send_full_chunks!(session::UploadSession, io::IOBuffer, chunk::Int)
 end
 
 """
-Encode all rows and upload them, returning the load job that results. With
-`gzip`, returns `nothing` instead if the compressed rows turn out not to fit in
-the file size BigQuery accepts; nothing has been loaded then, as a load job
-only starts once its upload is complete.
+Encode all the rows and upload them. Return the load job.
+
+With `gzip`, the function returns `nothing` if the compressed rows are too large
+for BigQuery. Then BigQuery has loaded nothing, because a load job starts only
+after its upload is complete.
 """
 function upload_rows(session::UploadSession, encoders, nrows::Int, progress::Progress; gzip::Bool)
     chunk = max(UPLOAD_CHUNK_UNIT, UPLOAD_CHUNK_BYTES[] ÷ UPLOAD_CHUNK_UNIT * UPLOAD_CHUNK_UNIT)
     limit = GZIP_LIMIT_BYTES[]
-    rows = IOBuffer()                 # encoded rows
-    packed = IOBuffer()               # the same compressed, when compressing
+    rows = IOBuffer()                 # the encoded rows
+    packed = IOBuffer()               # the same rows after compression, if the upload uses gzip
     gz = gzip ? GzipWriter() : nothing
     reported = 0
     try
@@ -240,7 +250,7 @@ function load_job_error(status::AbstractDict)
     result = status["errorResult"]
     message = string(something(get(result, "message", nothing), "the load job failed"))
     reason = string(something(get(result, "reason", nothing), ""))
-    # The first error only says that rows were rejected; the list says which and why.
+    # The first error only says that BigQuery rejected rows. The list shows which rows and why.
     details = String[]
     errors = get(status, "errors", nothing)
     if errors isa AbstractVector
@@ -256,7 +266,7 @@ function load_job_error(status::AbstractDict)
     return BigQueryError(message, reason, 0)
 end
 
-"Wait for a load job to finish and return its final description. Throws if the job failed."
+"Wait until a load job is complete. Return its final description. Throw an error if the job failed."
 function wait_for_job(conn::Connection, job, job_id::String, location::Union{Nothing,String})
     delay = 0.5
     try
@@ -275,7 +285,7 @@ function wait_for_job(conn::Connection, job, job_id::String, location::Union{Not
             job = api_json(conn, "GET", job_path(conn.project, job_id); query = ["location" => location])
         end
     catch e
-        # Ctrl-C while waiting: do not leave the load running.
+        # Ctrl-C during the wait: cancel the load job.
         e isa InterruptException && cancel_job(conn, conn.project, job_id, location)
         rethrow()
     end
@@ -291,9 +301,9 @@ end
 """
     bq_write_table(con, table, data; if_exists, types, compress, progress, ...) -> (table, rows, job_id)
 
-Upload `data` to a BigQuery table, creating the table if it does not exist.
-`data` is a `DataFrame` or any other Tables.jl table. The upload is a load job:
-it costs nothing, and either every row arrives or none does.
+Upload `data` to a BigQuery table. If the table does not exist, the function makes
+it. `data` is a `DataFrame` or a different Tables.jl table. The upload is a load
+job. It is free, and BigQuery loads all the rows or no rows.
 
 ```julia
 bq_write_table(con, "my_dataset.orders", df)
@@ -303,36 +313,38 @@ bq_write_table(con, "my_dataset.orders", df; if_exists = :replace, types = (plac
 
 Keywords:
 
-* `if_exists` — what to do when the table already exists: `:fail` (default)
-  throws, `:append` adds the rows to it, `:replace` overwrites the table,
-  schema included.
-* `types` — BigQuery types for columns of a new table, where the default is not
-  what you want: a `NamedTuple` or `Dict` of column name => type, such as
-  `"DATETIME"`, `"NUMERIC"` or `"ARRAY<DATE>"`. A type can also be a `Dict`
-  describing the column as the REST API does, for example
+* `if_exists`: what to do if the table exists. `:fail` (the default) throws an
+  error. `:append` adds the rows to the table. `:replace` replaces the table and
+  its schema.
+* `types`: the BigQuery types for the columns of a new table, if the default types
+  are not correct. Use a `NamedTuple` or `Dict` of column name => type, for example
+  `"DATETIME"`, `"NUMERIC"` or `"ARRAY<DATE>"`. A type can also be a `Dict` that
+  describes the column as the REST API does, for example
   `Dict("type" => "NUMERIC", "precision" => 10, "scale" => 2)`.
-* `compress` — gzip the rows on their way (default `true`), which makes the
-  upload several times smaller. BigQuery takes compressed uploads of up to
-  4 GB; a table that would be larger even compressed is sent uncompressed
-  instead, whatever this says.
-* `progress` — show a progress line for long uploads (default: in interactive sessions).
-* `location` — where to run the load job; by default that of the connection,
-  or else of the destination dataset.
-* `labels` — job labels.
+* `compress`: compress the rows with gzip (default `true`). This makes the upload
+  much smaller. BigQuery accepts compressed uploads of 4 GB maximum. If a table is
+  larger than that after compression, the function sends it without compression.
+* `progress`: show a progress line for long uploads (the default is true in
+  interactive sessions).
+* `location`: the location of the load job. The default is the location of the
+  connection. If the connection has no location, BigQuery uses the location of the
+  dataset.
+* `labels`: the job labels.
 
 A new table gets its column types from the Julia types: `Int` → `INT64`,
 `Float64` → `FLOAT64`, `Bool` → `BOOL`, `String` → `STRING`, `Date` → `DATE`,
-`DateTime` → `TIMESTAMP` (taken as UTC), `Time` → `TIME`, `BigFloat` →
+`DateTime` → `TIMESTAMP` (in UTC), `Time` → `TIME`, `BigFloat` →
 `BIGNUMERIC`, `Vector{UInt8}` → `BYTES`, other vectors → `ARRAY`, `NamedTuple`
-→ `STRUCT`. `missing` and `nothing` become `NULL`, and every column is nullable.
+→ `STRUCT`. `missing` and `nothing` become `NULL`. All the columns are nullable.
 
-When appending, the table's own schema decides how values are written, so a
-`DateTime` column goes into a `DATETIME` or a `TIMESTAMP` column alike, and
-`types` is not used. Columns are matched by name; ones the data lacks are left
-`NULL`. Text is accepted for a column of any type and parsed by BigQuery, which
-is the way to write exact `NUMERIC` values or timestamps with microseconds.
+When you append rows, the schema of the table controls how the function writes the
+values. Thus a `DateTime` column can go into a `DATETIME` column or a `TIMESTAMP`
+column, and the function does not use `types`. The function matches the columns
+by name. The table columns that are not in the data get `NULL`. A column of each
+type accepts text, and BigQuery parses it. Use text to write exact `NUMERIC`
+values or timestamps with microseconds.
 
-Returns the table's full name, the number of rows loaded and the job's id.
+Returns the full name of the table, the number of loaded rows and the job ID.
 """
 function bq_write_table(conn::Connection, table::AbstractString, data;
                         if_exists::Symbol = :fail,
@@ -348,7 +360,7 @@ function bq_write_table(conn::Connection, table::AbstractString, data;
     names, cols = table_columns(data)
     nrows = length(first(cols))
 
-    # Replacing a table replaces its schema too, so what is there does not matter.
+    # A replace also replaces the schema. Thus the current table is not important.
     existing = if_exists == :replace ? nothing : existing_fields(conn, ref)
     load = Dict{String,Any}(
         "destinationTable" => Dict{String,Any}("projectId" => ref.project, "datasetId" => ref.dataset,
@@ -376,7 +388,7 @@ function bq_write_table(conn::Connection, table::AbstractString, data;
     description = Dict{String,Any}("jobReference" => reference, "configuration" => configuration)
 
     encoders = row_encoders(fields, cols)
-    # Nothing to compress in an empty table, which is sent as an empty upload.
+    # An empty table has no data to compress. The package sends it as an empty upload.
     gzip = compress && nrows > 0 && gzip_fits(encoders, nrows)
     job = nothing
     while true
@@ -388,7 +400,7 @@ function bq_write_table(conn::Connection, table::AbstractString, data;
             finish!(bar)
         end
         job === nothing || break
-        # The estimate was wrong. The abandoned upload never became a job.
+        # The estimate was not correct. The upload that stopped did not become a job.
         @warn "The table does not fit in the 4 GB that BigQuery accepts as a compressed upload; " *
               "starting again without compression. Pass `compress = false` to skip the attempt."
         gzip = false

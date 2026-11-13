@@ -1,6 +1,6 @@
 const libcrypto = B.libcrypto
 
-# A throwaway RSA key, generated at test time (nothing secret is stored in the repo).
+# A temporary RSA key that the tests make when they start. The repository contains no secret.
 function generate_rsa_pem()
     pkey = ccall((:EVP_PKEY_Q_keygen, libcrypto), Ptr{Cvoid},
                  (Ptr{Cvoid}, Ptr{Cvoid}, Cstring, Csize_t...), C_NULL, C_NULL, "RSA", 2048)
@@ -50,7 +50,7 @@ function form_fields(body::AbstractString)
     return fields
 end
 
-# Environment that hides any real credentials on the machine running the tests.
+# An environment that hides the real credentials on the computer that runs the tests.
 function clean_env(f, extra::Pair...)
     withenv(f, "GOOGLE_APPLICATION_CREDENTIALS" => nothing, "GOOGLE_CLOUD_PROJECT" => nothing,
             "GCLOUD_PROJECT" => nothing, "CLOUDSDK_CONFIG" => mktempdir(), "NO_GCE_CHECK" => "true",
@@ -83,11 +83,11 @@ end
             con = clean_env() do
                 bq_connect(; credentials = path, endpoint = base)
             end
-            @test con.project == "sa-project"                 # taken from the key file
+            @test con.project == "sa-project"                 # from the key file
             @test occursin("sa@proj.iam.gserviceaccount.com", sprint(show, con))
             @test !occursin("PRIVATE", sprint(show, con))
             @test bq_query(con, "SELECT 1").x == [1]
-            bq_query(con, "SELECT 1")                         # token is reused
+            bq_query(con, "SELECT 1")                         # the package uses the same token again
             log = requests(server)
             token_calls = filter(r -> r.path == "/token", log)
             @test length(token_calls) == 1
@@ -103,13 +103,14 @@ end
             @test rs256_verify(TEST_KEY, Vector{UInt8}(header * "." * claims), base64url_decode(signature))
             api_calls = filter(r -> startswith(r.path, "/bigquery"), log)
             @test all(r -> r.auth == "Bearer mock-token-1", api_calls)
+            @test all(r -> isempty(r.user_project), api_calls)      # only user credentials have a quota project
 
-            # An expired/revoked token (401) is refreshed transparently, once.
+            # After a 401 (an expired or revoked token), the package gets a new token one time, automatically.
             push!(server.reject_tokens, "mock-token-1")
             @test bq_query(con, "SELECT 1").x == [1]
             @test count(r -> r.path == "/token", requests(server)) == 2
 
-            # Custom scopes.
+            # Scopes from the user.
             con2 = bq_connect("p"; credentials = key, endpoint = base,
                               scopes = ["https://www.googleapis.com/auth/bigquery", "https://www.googleapis.com/auth/drive.readonly"])
             reset_log!(server)
@@ -125,7 +126,7 @@ end
             dir = mktempdir()
             write(joinpath(dir, "application_default_credentials.json"), JSON.json(adc))
             reset_log!(server)
-            # Found through the gcloud config directory, as on a machine where gcloud was used.
+            # The package finds the file in the gcloud configuration directory, as on a computer that has used gcloud.
             con = clean_env("CLOUDSDK_CONFIG" => dir) do
                 bq_connect(; endpoint = base)
             end
@@ -134,8 +135,15 @@ end
             form = form_fields(first(requests(server)).body)
             @test form == Dict("grant_type" => "refresh_token", "client_id" => "cid",
                                "client_secret" => "csecret", "refresh_token" => "rtoken")
+            # User credentials send their quota project, as the Google client libraries do.
+            api_calls = filter(r -> startswith(r.path, "/bigquery"), requests(server))
+            @test !isempty(api_calls) && all(r -> r.user_project == "quota-project", api_calls)
+            @test B.user_project(con) == "quota-project"
+            no_quota = bq_connect("p"; credentials = delete!(copy(adc), "quota_project_id"), endpoint = base)
+            @test B.user_project(no_quota) == ""
+            @test !any(p -> first(p) == "x-goog-user-project", B.auth_headers(no_quota))
 
-            # GOOGLE_APPLICATION_CREDENTIALS wins, and an explicit project wins over the file's.
+            # GOOGLE_APPLICATION_CREDENTIALS has priority, and an explicit project has priority over the project in the file.
             path = joinpath(dir, "application_default_credentials.json")
             con = clean_env("GOOGLE_APPLICATION_CREDENTIALS" => path, "GOOGLE_CLOUD_PROJECT" => "env-project") do
                 bq_connect(; endpoint = base)
@@ -162,7 +170,7 @@ end
             reset_log!(server)
             @test bq_query(con, "SELECT 1").x == [1]
             @test first(requests(server)).auth == "Bearer static-token"
-            # A rejected static token cannot be refreshed: the 401 surfaces.
+            # The package cannot refresh a static token. Thus the 401 goes to the caller.
             push!(server.reject_tokens, "static-token")
             err = try
                 bq_query(con, "SELECT 1")
@@ -206,7 +214,7 @@ end
                 bq_connect("p")
             end
             @test_throws ArgumentError bq_connect("p"; credentials = Dict("type" => "external_account"))
-            @test_throws ArgumentError clean_env(() -> bq_connect(; token = "t"))     # no project anywhere
+            @test_throws ArgumentError clean_env(() -> bq_connect(; token = "t"))     # there is no project
         end
     finally
         stop!(server)

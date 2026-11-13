@@ -1,9 +1,10 @@
-# The handful of protobuf messages the Storage Read API needs, encoded and
-# decoded by hand. Field numbers come from google/cloud/bigquery/storage/v1
-# (storage.proto, stream.proto, arrow.proto) in github.com/googleapis/googleapis.
+# The protobuf messages that the Storage Read API uses. The functions in this file
+# encode and decode them directly. The field numbers are from
+# google/cloud/bigquery/storage/v1 (storage.proto, stream.proto, arrow.proto) in
+# github.com/googleapis/googleapis.
 #
-# Doing this by hand keeps the package free of a protobuf code generator and a
-# gRPC library; the wire format for these messages is small and stable.
+# Thus the package does not use a protobuf code generator or a gRPC library. The
+# wire format of these messages is small and stable.
 
 function pb_varint(io::IO, x::UInt64)
     while x >= 0x80
@@ -49,9 +50,9 @@ function pb_read_varint(buf::AbstractVector{UInt8}, pos::Int, hi::Int)
 end
 
 """
-Call `f(field, wiretype, value, range)` for each field in `buf[lo:hi]`. `value`
-is set for varints; `range` is the payload's byte range for length-delimited
-and fixed-width fields.
+Call `f(field, wiretype, value, range)` for each field in `buf[lo:hi]`. For a
+varint, `value` contains the value. For length-delimited and fixed-width fields,
+`range` is the byte range of the payload.
 """
 function pb_foreach(f, buf::AbstractVector{UInt8}, lo::Int, hi::Int)
     pos = lo
@@ -165,8 +166,8 @@ end
 ReadRowsResponse { 4: ArrowRecordBatch { 1: serialized_record_batch, 2: row_count (deprecated) },
                    6: row_count }
 
-Returns `(byte range of the record batch within buf, row count)`; the range is
-empty when the message carries no rows.
+Returns `(the byte range of the record batch in buf, the row count)`. The range is
+empty if the message has no rows.
 """
 function decode_read_rows_response(buf::Vector{UInt8})
     batch = 0:-1

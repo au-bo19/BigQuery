@@ -17,7 +17,7 @@
     @test [f.name => B.describe(f) for f in st.fields] == ["a" => "INT64", "b" => "ARRAY<STRING>", "c" => "RECORD"]
     @test kind([[(a = 1,)]]) == "ARRAY<RECORD>"
 
-    # Loose element types: the values decide.
+    # General element types: the values give the type.
     @test kind(Any[1, 2]) == "INT64"
     @test kind(Any[1, 2.5, missing]) == "FLOAT64" && kind(Real[2.5, 1]) == "FLOAT64"
     @test kind(Any["a", missing]) == "STRING"
@@ -26,10 +26,10 @@
     @test_throws ArgumentError field(Any[1, "a"])
     @test_throws ArgumentError field(Any[[1], 1])
     @test_throws ArgumentError field([1 + 2im])
-    @test_throws ArgumentError field([[[1]]])               # BigQuery has no arrays of arrays
+    @test_throws ArgumentError field([[[1]]])               # BigQuery has no arrays of arrays.
     @test_throws ArgumentError field([(a = 1, b = missing)])
 
-    # Types given by the user.
+    # Types from the user.
     f = B.field_from_spec("c", "datetime")
     @test f.type == "DATETIME" && !f.repeated && f.kind == B.K_DATETIME
     f = B.field_from_spec("c", " array< date > ")
@@ -53,7 +53,7 @@
     @test_throws ArgumentError B.infer_fields(names, cols, (nope = "STRING",))
     @test_throws ArgumentError B.infer_fields(names, cols, ["a" => "STRING"])
 
-    # A new table is described with the type names the API itself uses.
+    # The description of a new table uses the type names of the API.
     described = [B.schema_json(B.infer_column("c", col)) for col in ([1], [1.5], [true], [[(a = "x",)]])]
     @test [d["type"] for d in described] == ["INTEGER", "FLOAT", "BOOLEAN", "RECORD"]
     @test [d["mode"] for d in described] == ["NULLABLE", "NULLABLE", "NULLABLE", "REPEATED"]
@@ -92,14 +92,14 @@ end
     @test enc("DATETIME", DateTime(1, 2, 3, 4, 5, 6)) == "\"0001-02-03T04:05:06.000\""
     @test enc("DATE", Date(2024, 1, 31)) == "\"2024-01-31\""
     @test enc("TIME", Time(23, 59, 59, 999, 999, 999)) == "\"23:59:59.999999\"" && enc("TIME", Time(0)) == "\"00:00:00.000000\""
-    @test_throws ArgumentError enc("DATE", DateTime(2024, 1, 31))     # would silently drop the time of day
+    @test_throws ArgumentError enc("DATE", DateTime(2024, 1, 31))     # This must not remove the time of day without an error.
     @test_throws ArgumentError enc("TIMESTAMP", DateTime(10_000))
     @test_throws ArgumentError enc("TIME", 5)
 
     @test enc("NUMERIC", 0.1) == "0.1" && enc("NUMERIC", 12) == "12" && enc("NUMERIC", -99.75) == "-99.75"
     @test enc("NUMERIC", 1.5e6) == "1500000" && enc("NUMERIC", 1.0e-7) == "0.00000010" && enc("NUMERIC", -1.2345e10) == "-12345000000"
     @test enc("NUMERIC", big"0.1") == "0.1" && enc("NUMERIC", 1 // 3) == "0.333333333" && enc("NUMERIC", big"-0.05") == "-0.05"
-    # Rounded to the digits the type keeps: 9 for NUMERIC, 38 for BIGNUMERIC.
+    # The values are rounded to the digits that the type keeps: 9 for NUMERIC, 38 for BIGNUMERIC.
     @test enc("NUMERIC", 0.1 + 0.2) == "0.3" && enc("NUMERIC", 3.0000000000000004e-7) == "0.0000003"
     @test enc("NUMERIC", 2 / 3) == "0.666666667" && enc("NUMERIC", -2 / 3) == "-0.666666667" && enc("NUMERIC", 1.0e-12) == "0"
     @test enc("NUMERIC", 1.0e25) == "1" * "0"^25 && enc("NUMERIC", 123456789.123456789) == "123456789.12345679"
@@ -113,11 +113,16 @@ end
     @test enc("JSON", "{\"a\": [1,\n 2]}") == "{\"a\":[1,2]}" && enc("JSON", Dict("a" => 1)) == "{\"a\":1}"
     @test enc("JSON", "\"text\"") == "\"text\"" && enc("JSON", [1, 2]) == "[1,2]"
     @test_throws ArgumentError enc("JSON", "{not json")
+    # The text of a JSON document does not change, except the whitespace between the tokens.
+    @test enc("JSON", "{\"price\": 0.12345678901234567890, \"id\": 1.50, \"n\": 1e400}") ==
+          "{\"price\":0.12345678901234567890,\"id\":1.50,\"n\":1e400}"
+    @test enc("JSON", " { \"s\" : \"a b\\t\\\"c\\\\\" ,\r\n \"k\": [ 1 , 2 ] } ") == "{\"s\":\"a b\\t\\\"c\\\\\",\"k\":[1,2]}"
+    @test enc("JSON", "{\"u\": \"ünï 😀\"}") == "{\"u\":\"ünï 😀\"}"
     @test enc("GEOGRAPHY", "POINT(1 2)") == "\"POINT(1 2)\""
     @test enc("RANGE", "[2024-01-01, 2024-02-01)") == "\"[2024-01-01, 2024-02-01)\""
     @test_throws ArgumentError enc("RANGE", 5)
 
-    # Text is passed on for BigQuery to parse.
+    # The text goes to BigQuery, and BigQuery parses it.
     @test enc("INT64", "42") == "\"42\"" && enc("NUMERIC", "123.456789012") == "\"123.456789012\""
     @test enc("TIMESTAMP", "2024-01-01 00:00:00.123456 UTC") == "\"2024-01-01 00:00:00.123456 UTC\""
 
@@ -136,7 +141,7 @@ end
     @test rec(missing) == "null"
     @test_throws ArgumentError rec(5)
 
-    # Rows: typed (tuple) and wide-table (vector) encoders write the same thing.
+    # Rows: the typed encoders (a tuple) and the encoders for wide tables (a vector) write the same text.
     fields = [B.WriteField("id", "INT64", false), B.WriteField("we\"ird", "STRING", false)]
     cols = AbstractVector[[1, 2], Union{Missing,String}["a", missing]]
     typed = B.row_encoders(fields, cols)
@@ -153,10 +158,10 @@ end
     data = Vector{UInt8}(join(("{\"id\":$i,\"name\":\"row $i\"}\n" for i in 1:50_000)))
     packed = B.gzip_bytes(data)
     @test is_gzip(packed) && length(packed) < length(data) ÷ 3
-    @test gunzip(packed) == data                 # read back by another implementation
+    @test gunzip(packed) == data                 # a different implementation reads it
     @test gunzip(B.gzip_bytes(UInt8[])) == UInt8[]
 
-    # Written piece by piece, as an upload does, it is one stream all the same.
+    # If the package writes the data in parts, as an upload does, the result is also one stream.
     gz = B.GzipWriter()
     out = IOBuffer()
     for a in 1:100_000:length(data)
@@ -164,7 +169,7 @@ end
     end
     B.deflate!(out, gz, UInt8[]; finish = true)
     close(gz)
-    close(gz)                                    # closing twice is harmless
+    close(gz)                                    # a second close causes no problem
     @test gunzip(take!(out)) == data
     @test_throws ErrorException B.deflate!(out, gz, data)
 
@@ -192,7 +197,7 @@ end
             log = requests(server)
             check_table(read_back("ds.up"), small)
 
-            @test length(log) == 3           # look for the table, open the upload, send the rows
+            @test length(log) == 3           # find the table, open the upload, send the rows
             @test log[1].method == "GET" && log[1].path == "/bigquery/v2/projects/proj/datasets/ds/tables/up"
             @test log[2].method == "POST" && log[2].path == "/upload/bigquery/v2/projects/proj/jobs"
             @test log[2].params["uploadType"] == "resumable"
@@ -210,7 +215,7 @@ end
             @test [(f["name"], f["type"]) for f in sent[end]["fields"]] == [("a", "INTEGER"), ("b", "STRING")]
             @test log[3].method == "PUT" && log[3].params["upload_id"] == "upload_1" && log[3].auth == "Bearer t"
             @test log[3].range == "bytes 0-$(ncodeunits(log[3].body) - 1)/$(ncodeunits(log[3].body))"
-            @test is_gzip(log[3].body)                       # compressed unless asked otherwise
+            @test is_gzip(log[3].body)                       # compressed, if the caller does not ask for a different behaviour
             text = String(gunzip(log[3].body))
             @test count(==('\n'), text) == 50 && endswith(text, "}\n")
             @test ncodeunits(log[3].body) < ncodeunits(text) ÷ 2
@@ -243,7 +248,7 @@ end
             @test err isa BigQueryError && err.reason == "duplicate" && occursin("if_exists = :append", err.message)
             @test isempty(upload_requests())
 
-            # Appending: the table's schema (DATETIME, NUMERIC) decides how values are written.
+            # Append: the schema of the table (DATETIME, NUMERIC) controls how the package writes the values.
             more = truth_table(80)
             res = bq_write_table(con, "ds.target", more; if_exists = :append, progress = false)
             @test res.rows == 80
@@ -253,7 +258,7 @@ end
             check_table(df[1:50, :], small)
             check_table(df[51:130, :], more)
 
-            # Columns are matched by name, whatever their order or case; the others stay NULL.
+            # The package matches the columns by name, in all sequences and letter cases. The other columns stay NULL.
             reset_log!(server)
             bq_write_table(con, "ds.target", (NAME = ["only"], id = [999]); if_exists = :append)
             @test String(gunzip(last(requests(server)).body)) == "{\"name\":\"only\",\"id\":999}\n"
@@ -270,7 +275,7 @@ end
             @test err isa ArgumentError && occursin("`nope`, `Nada`", err.msg) && occursin("proj.ds.target", err.msg)
             @test isempty(upload_requests())
 
-            # A value the column cannot take: nothing is loaded, and the error says which row and why.
+            # A value that the column cannot accept: BigQuery loads nothing, and the error shows which row and why.
             err = try
                 bq_write_table(con, "ds.target", (id = ["12", "abc"],); if_exists = :append)
             catch e
@@ -282,7 +287,7 @@ end
             @test nrow(read_back("ds.target")) == 131
             @test_throws ArgumentError bq_write_table(con, "ds.target", (flag = [1, 0],); if_exists = :append)
 
-            # Replacing does not need to know what is there.
+            # A replace does not examine the current table.
             reset_log!(server)
             res = bq_write_table(con, "ds.target", (a = [1, 2, 3], b = ["x", missing, "z"]); if_exists = :replace)
             @test res.rows == 3 && !any(r -> r.method == "GET", requests(server))
@@ -290,6 +295,21 @@ end
             @test [f["name"] for f in load_config()["schema"]["fields"]] == ["a", "b"]
             df = read_back("ds.target")
             @test names(df) == ["a", "b"] && df.a == [1, 2, 3] && isequal(df.b, ["x", missing, "z"])
+        end
+
+        @testset "a dataset that does not exist" begin
+            # The upload stops before it sends rows, because the load job can only fail.
+            push!(server.missing_datasets, "no_such_ds")
+            reset_log!(server)
+            err = try
+                bq_write_table(con, "no_such_ds.t", small; progress = false)
+            catch e
+                e
+            end
+            @test err isa BigQueryError && err.status == 404 && occursin("Dataset", err.message)
+            @test occursin("create the dataset first", err.message)
+            @test isempty(upload_requests())
+            delete!(server.missing_datasets, "no_such_ds")
         end
 
         @testset "large uploads go in chunks" begin
@@ -306,7 +326,7 @@ end
             @test puts[end].range == "bytes $(starts[end])-$(sum(sizes) - 1)/$(sum(sizes))"
             check_table(read_back("ds.big"), large)
 
-            # The server keeps only part of what each request carries.
+            # The server keeps only a part of the bytes of each request.
             server.upload_accept_bytes = 256 * 1024
             reset_log!(server)
             bq_write_table(con, "ds.big", large; if_exists = :replace, progress = false, compress = false)
@@ -314,19 +334,19 @@ end
             @test count(r -> r.method == "PUT", requests(server)) >= 2 * (length(puts) - 1)
             check_table(read_back("ds.big"), large)
 
-            # Requests fail before anything was stored ...
+            # Requests fail before the server keeps bytes ...
             server.fail_upload_requests = 2
             bq_write_table(con, "ds.big", large; if_exists = :replace, progress = false, compress = false)
             @test server.fail_upload_requests == 0
             check_table(read_back("ds.big"), large)
 
-            # ... or after: the bytes arrived, the answer did not. Nothing may be sent twice.
+            # ... or after: the bytes arrived, but the response did not. The package must not send bytes two times.
             server.lose_upload_responses = 2
             bq_write_table(con, "ds.big", large; if_exists = :replace, progress = false, compress = false)
             @test server.lose_upload_responses == 0
             check_table(read_back("ds.big"), large)
 
-            # Compressed, the same table takes fewer chunks, cut wherever the gzip stream happens to be.
+            # With compression, the same table uses fewer chunks. The chunk limits can be at all positions in the gzip stream.
             B.UPLOAD_CHUNK_BYTES[] = 256 * 1024
             reset_log!(server)
             bq_write_table(con, "ds.big", large; if_exists = :replace, progress = false)
@@ -343,7 +363,7 @@ end
             @test server.lose_upload_responses == 0 && last_upload()[:gzip]
             check_table(read_back("ds.big"), large)
 
-            # The same for the request that completes the upload and starts the job.
+            # Do the same test for the request that completes the upload and starts the job.
             B.UPLOAD_CHUNK_BYTES[] = chunk_bytes
             server.lose_upload_responses = 1
             res = bq_write_table(con, "ds.once", small; progress = false)
@@ -367,23 +387,24 @@ end
             res = bq_write_table(con, "ds.none", (a = Int[], b = String[]))
             @test res.rows == 0
             put = last(requests(server))
-            @test put.method == "PUT" && put.range == "bytes */0" && isempty(put.body)      # not even a gzip header
+            @test put.method == "PUT" && put.range == "bytes */0" && isempty(put.body)      # also no gzip header
             df = read_back("ds.none")
             @test size(df) == (0, 2) && eltype(df.a) == Int64 && eltype(df.b) == String
         end
 
         @testset "tables too large to upload compressed" begin
-            # BigQuery takes a gzip file of at most 4 GB. Pretend the limit is much lower.
+            # BigQuery accepts a gzip file of 4 GB maximum. For this test, the limit is much lower.
             B.GZIP_LIMIT_BYTES[] = server.max_gzip_bytes = 1_000
             reset_log!(server)
             res = @test_logs min_level = Base.CoreLogging.Warn bq_write_table(con, "ds.limit", small; progress = false)
             @test res.rows == 50 && !last_upload()[:gzip]
-            @test count(r -> r.method == "POST", upload_requests()) == 1     # known beforehand, from a sample
+            @test count(r -> r.method == "POST", upload_requests()) == 1     # The sample gives this result before the upload.
             check_table(read_back("ds.limit"), small)
 
-            # The sample can mislead: here every sampled row compresses to almost nothing and
-            # the rows between them hardly at all. The upload is started again uncompressed,
-            # when the limit is passed on the way (the larger table) or at the very end.
+            # The sample can give an incorrect estimate. Here, each row in the sample becomes
+            # almost nothing after compression, and the other rows become only a little smaller.
+            # The package starts the upload again without compression. This occurs during
+            # the upload (the larger table) or at the end.
             for (n, limit) in ((3_000, 100_000), (40_000, 1_000_000))
                 sampled = Set(B.sample_rows(n))
                 text = [i in sampled ? "a"^200 : String(rand(UInt8('a'):UInt8('z'), 200)) for i in 1:n]
@@ -411,9 +432,9 @@ end
             server.load_polls = 0
             @test res.rows == 2
             polls = filter(r -> r.method == "GET" && occursin("/jobs/", r.path), requests(server))
-            @test length(polls) == 3                 # two "still running" answers, then the result
+            @test length(polls) == 3                 # two "running" responses, then the result
             @test all(r -> r.path == "/bigquery/v2/projects/proj/jobs/$(res.job_id)", polls)
-            @test all(r -> r.params["location"] == "US", polls)      # the job's location is carried along
+            @test all(r -> r.params["location"] == "US", polls)      # each poll sends the location of the job
         end
 
         @testset "request options and other tables" begin
@@ -430,13 +451,13 @@ end
             @test job["jobReference"] == Dict("projectId" => "proj", "jobId" => job["jobReference"]["jobId"], "location" => "US")
             @test job["configuration"]["load"]["destinationTable"]["projectId"] == "other-proj"
 
-            # More columns than are encoded through a typed tuple.
+            # More columns than the typed tuple encoders accept.
             wide = NamedTuple{Tuple(Symbol("c", i) for i in 1:40)}(Tuple([i, -i] for i in 1:40))
             bq_write_table(con, "ds.wide", wide)
             df = read_back("ds.wide")
             @test size(df) == (2, 40) && df.c1 == [1, -1] && df.c40 == [40, -40]
 
-            # Columns without a concrete element type.
+            # Columns that do not have a concrete element type.
             loose = DataFrame(n = Any[1, 2.5, missing], s = Any["a", missing, "c"], v = Any[[1], Any[], [2, 3]])
             bq_write_table(con, "ds.loose", loose)
             df = read_back("ds.loose")

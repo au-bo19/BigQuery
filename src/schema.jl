@@ -1,15 +1,15 @@
-# BigQuery schemas and their mapping to Julia types.
+# BigQuery schemas and the related Julia types.
 #
 #   INT64 -> Int64             DATE      -> Date
-#   FLOAT64 -> Float64         DATETIME  -> DateTime (milliseconds kept)
+#   FLOAT64 -> Float64         DATETIME  -> DateTime (the package keeps milliseconds)
 #   BOOL -> Bool               TIME      -> Time
-#   STRING -> String           TIMESTAMP -> DateTime in UTC (milliseconds kept)
+#   STRING -> String           TIMESTAMP -> DateTime in UTC (the package keeps milliseconds)
 #   BYTES -> Vector{UInt8}     NUMERIC   -> Float64
 #   STRUCT -> NamedTuple       BIGNUMERIC -> BigFloat
 #   ARRAY<T> -> Vector{T}      GEOGRAPHY / JSON / INTERVAL -> String
 #
-# NULL becomes `missing`. A column only gets a `Union{Missing,T}` element type
-# when it actually contains a NULL.
+# A NULL becomes `missing`. A column gets the element type `Union{Missing,T}` only
+# if it contains a NULL.
 
 @enum Kind::UInt8 begin
     K_INT
@@ -33,7 +33,7 @@ struct Field
     repeated::Bool
     nullable::Bool
     fields::Vector{Field}
-    T::Type   # Julia type of a single non-NULL value (the element type when repeated)
+    T::Type   # The Julia type of one value that is not NULL (the element type if the field is repeated)
 end
 
 function kind_of(typ::AbstractString)
@@ -50,7 +50,7 @@ function kind_of(typ::AbstractString)
     t == "NUMERIC" && return K_NUMERIC
     t == "BIGNUMERIC" && return K_BIGNUMERIC
     t in ("RECORD", "STRUCT") && return K_RECORD
-    return K_RAW   # e.g. RANGE: kept as text
+    return K_RAW   # For example RANGE. The package keeps the text.
 end
 
 function scalar_type(kind::Kind)
@@ -66,10 +66,10 @@ function scalar_type(kind::Kind)
     return String
 end
 
-# Type of a value nested inside a STRUCT.
+# The type of a value in a STRUCT.
 nested_type(f::Field) = f.repeated ? Vector{f.T} : f.nullable ? Union{Missing,f.T} : f.T
 
-# Element type used while a top-level column is being built.
+# The element type of a top-level column while the package makes the column.
 column_type(f::Field) = f.repeated ? Vector{f.T} : Union{Missing,f.T}
 
 function Field(d::AbstractDict)
@@ -108,7 +108,7 @@ end
 
 new_columns(fields::Vector{Field}) = Any[column_type(f)[] for f in fields]
 
-# --- assembling columns -----------------------------------------------------
+# --- make columns -----------------------------------------------------------
 
 function _concat(first::Vector{T}, parts::Vector{Any}) where {T}
     total = 0
@@ -125,18 +125,18 @@ function _concat(first::Vector{T}, parts::Vector{Any}) where {T}
     return out
 end
 
-"Concatenate same-typed vectors without the quadratic cost of repeated `vcat`."
+"Concatenate vectors of the same type. Repeated `vcat` calls have a quadratic cost, but this function does not."
 function concat_parts(parts::Vector{Any})
     length(parts) == 1 && return parts[1]
     return _concat(parts[1], parts)
 end
 
-"Concatenate chunks (each a vector of columns) column by column."
+"Concatenate chunks (each chunk is a vector of columns), one column at a time."
 function concat_chunks(chunks::Vector{Vector{Any}}, ncols::Integer)
     return Any[concat_parts(Any[c[j] for c in chunks]) for j in 1:ncols]
 end
 
-"Drop `Missing` from the element type when the column holds no NULL."
+"Remove `Missing` from the element type if the column contains no NULL."
 function narrow_column(col::AbstractVector)
     T = eltype(col)
     (T !== Missing && Missing <: T) || return col

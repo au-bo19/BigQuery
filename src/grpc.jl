@@ -1,9 +1,9 @@
-# A minimal gRPC client: unary and server-streaming calls over libcurl's HTTP/2.
+# A minimal gRPC client: unary calls and server-stream calls over the HTTP/2 of libcurl.
 #
-# gRPC is "just" HTTP/2 POSTs whose bodies are length-prefixed protobuf
-# messages, with the call status delivered in trailers. libcurl (shipped with
-# Julia as the Downloads standard library) handles HTTP/2 and trailers, so the
-# only work here is the 5-byte message framing.
+# A gRPC call is an HTTP/2 POST request. Its body contains protobuf messages, each
+# with a length prefix. The status of the call is in the trailers. libcurl (in Julia,
+# through the Downloads standard library) supports HTTP/2 and trailers. Thus this
+# file only adds and removes the 5-byte message frames.
 
 struct GrpcError <: Exception
     code::Int
@@ -21,12 +21,12 @@ grpc_code_name(code::Integer) = get(GRPC_CODE_NAMES, Int(code), "code $code")
 Base.showerror(io::IO, e::GrpcError) =
     print(io, "BigQuery Storage API error (", grpc_code_name(e.code), "): ", e.message)
 
-# Transient conditions for which a call may be retried.
+# Temporary conditions. After one of these errors, the client can try the call again.
 grpc_retryable(e::GrpcError) = e.code in (4, 8, 10, 13, 14)
 
 """
-Receives the response body from libcurl, cuts it into gRPC messages and hands
-each complete message to `on_message`.
+Gets the response body from libcurl and cuts it into gRPC messages. Gives each
+complete message to `on_message`.
 """
 mutable struct GrpcSink <: IO
     buf::Vector{UInt8}
@@ -37,7 +37,7 @@ end
 GrpcSink(on_message) = GrpcSink(UInt8[], on_message, nothing, Base.Event())
 
 function Base.unsafe_write(sink::GrpcSink, p::Ptr{UInt8}, nb::UInt)
-    sink.error === nothing || return nb      # already failed: drain and ignore
+    sink.error === nothing || return nb      # a failure occurred before: accept the data and ignore it
     old = length(sink.buf)
     resize!(sink.buf, old + nb)
     GC.@preserve sink unsafe_copyto!(pointer(sink.buf, old + 1), p, nb)
@@ -46,7 +46,7 @@ function Base.unsafe_write(sink::GrpcSink, p::Ptr{UInt8}, nb::UInt)
     catch e
         sink.error = e
         empty!(sink.buf)
-        notify(sink.interrupt)               # abort the transfer
+        notify(sink.interrupt)               # stop the transfer
     end
     return nb
 end
@@ -82,13 +82,14 @@ function grpc_frame(message::Vector{UInt8})
     return frame
 end
 
-# `interrupt` (cancel an in-flight request) arrived in Downloads 1.7.
+# Downloads 1.7 added `interrupt` (cancel a request that is in progress).
 const DOWNLOADS_HAS_INTERRUPT =
     any(m -> :interrupt in Base.kwarg_decl(m), methods(Downloads.request))
 
 """
-A set of in-flight calls that can be cancelled together, used to stop the other
-read streams when one fails or the user presses Ctrl-C.
+A set of calls in progress that the package can cancel together. If one read
+stream fails, or if the user pushes Ctrl-C, the package uses it to stop the other
+streams.
 """
 mutable struct CancelGroup
     lock::ReentrantLock
@@ -132,19 +133,22 @@ end
 function header_value(headers, name::AbstractString)
     value = nothing
     for (k, v) in headers
-        k == name && (value = v)     # trailers come last; the last occurrence wins
+        k == name && (value = v)     # the trailers come last, thus use the last value
     end
     return value
 end
 
 """
-    grpc_call(on_message, dl, url, token, request; routing, cancel)
+    grpc_call(on_message, dl, url, token, request; routing, user_project, cancel)
 
-POST one protobuf `request` to a gRPC method and call `on_message(bytes)` for
-every response message. Throws `GrpcError` unless the call ends with status OK.
+Send one protobuf `request` to a gRPC method with a POST request. Call
+`on_message(bytes)` for each response message. Throw `GrpcError` if the call does
+not end with the status OK. If `user_project` is not empty, the request sends it in
+the `x-goog-user-project` header.
 """
 function grpc_call(on_message, dl::Downloads.Downloader, url::AbstractString, token::AbstractString,
                    request::Vector{UInt8}; routing::AbstractString = "",
+                   user_project::AbstractString = "",
                    cancel::Union{Nothing,CancelGroup} = nothing)
     sink = GrpcSink(on_message)
     headers = Pair{String,String}[
@@ -155,6 +159,7 @@ function grpc_call(on_message, dl::Downloads.Downloader, url::AbstractString, to
         "authorization" => "Bearer " * token,
     ]
     isempty(routing) || push!(headers, "x-goog-request-params" => routing)
+    isempty(user_project) || push!(headers, "x-goog-user-project" => String(user_project))
     cancel === nothing || register!(cancel, sink.interrupt)
     kwargs = DOWNLOADS_HAS_INTERRUPT ? (; interrupt = sink.interrupt) : (;)
     resp = try

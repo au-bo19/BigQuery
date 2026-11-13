@@ -1,5 +1,5 @@
-# Gzip compression for uploads, through the zlib library that ships with Julia.
-# Only what an upload needs: one stream, written to piece by piece.
+# Gzip compression for uploads, with the zlib library that Julia includes. This file
+# has only the functions that an upload uses: one stream that the package writes in parts.
 
 const Z_NO_FLUSH = Cint(0)
 const Z_FINISH = Cint(4)
@@ -8,12 +8,12 @@ const Z_STREAM_END = Cint(1)
 const Z_BUF_ERROR = Cint(-5)
 const Z_DEFLATED = Cint(8)
 
-# Fast rather than small: at this level compressing keeps ahead of most
-# connections, and the higher levels gain little on JSON rows.
+# Fast compression, not the smallest output. At this level, the compression is faster
+# than most connections. The higher levels make JSON rows only a little smaller.
 const GZIP_LEVEL = Cint(1)
 
-# zlib's `z_stream`. zlib keeps a pointer to it, so it must stay where it is: a
-# mutable struct does, since Julia's garbage collector does not move objects.
+# The `z_stream` of zlib. zlib keeps a pointer to it, thus it must not move in memory.
+# A mutable struct does not move, because the Julia garbage collector does not move objects.
 mutable struct ZStream
     next_in::Ptr{UInt8}
     avail_in::Cuint
@@ -41,7 +41,7 @@ end
 function GzipWriter(level::Integer = GZIP_LEVEL)
     stream = ZStream()
     version = unsafe_string(ccall((:zlibVersion, libz), Cstring, ()))
-    # Window bits 15 + 16: the largest window, wrapped as gzip instead of zlib.
+    # Window bits 15 + 16: the largest window, with a gzip wrapper (not a zlib wrapper).
     code = ccall((:deflateInit2_, libz), Cint, (Ref{ZStream}, Cint, Cint, Cint, Cint, Cint, Cstring, Cint),
                  stream, level, Z_DEFLATED, 15 + 16, 8, 0, version, sizeof(ZStream))
     code == Z_OK || error("zlib could not start compressing (code $code)")
@@ -56,8 +56,8 @@ function Base.close(gz::GzipWriter)
 end
 
 """
-Compress `input` and append what zlib produces to `out`. zlib holds some bytes
-back until it has seen more; `finish = true` ends the stream and writes it all.
+Compress `input` and add the zlib output to `out`. zlib keeps some bytes until it
+gets more input. `finish = true` ends the stream and writes all the remaining bytes.
 """
 function deflate!(out::IO, gz::GzipWriter, input::Vector{UInt8}; finish::Bool = false)
     gz.isopen || error("this gzip stream has been closed")
@@ -78,7 +78,7 @@ function deflate!(out::IO, gz::GzipWriter, input::Vector{UInt8}; finish::Bool = 
                 code == Z_STREAM_END && break
                 produced == 0 && error("zlib stopped before the end of the stream")
             elseif z.avail_out != 0
-                break       # room was left over: zlib has nothing more to give for now
+                break       # Space remains in the buffer, thus zlib has no more output now.
             end
         end
     end

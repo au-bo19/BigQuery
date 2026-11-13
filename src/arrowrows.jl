@@ -1,14 +1,14 @@
-# Turning Arrow record batches (from the Storage Read API) into the same Julia
-# column types the REST decoder produces.
+# Change Arrow record batches (from the Storage Read API) into the same Julia
+# column types that the REST decoder makes.
 #
-# Arrow.jl is asked not to convert logical types itself (`convert = false`):
-# its own TIMESTAMP conversion goes through `ZonedDateTime`, which is slow and
-# would differ from the REST path. Values are converted here instead.
+# Arrow.jl does not convert the logical types here (`convert = false`). Its
+# TIMESTAMP conversion uses `ZonedDateTime`. That conversion is slow, and its
+# result is different from the REST result. This file converts the values.
 
 const TimeUnit = Arrow.Meta.TimeUnit
 const DateUnit = Arrow.Meta.DateUnit
 
-"Julia type that an Arrow element type is converted to."
+"The Julia type for an Arrow element type."
 function target_type(T::Type)
     T === Missing && return Missing
     if Missing <: T
@@ -42,14 +42,35 @@ end
     return x * 1_000_000_000
 end
 
-# cv(R, x): convert Arrow value `x` to target type `R`.
+# The largest integer that a Float64 holds exactly, and all smaller integers also.
+const EXACT_FLOAT_INT = 2^53
+
+"""
+The Float64 nearest to `value / 10^scale`, the same as the REST decoder gives
+for the decimal text.
+
+If `value` is small, the function divides directly. Both operands are exact, thus
+one division gives the correctly rounded result. If `value` is large,
+`Float64(value)` rounds, and the division then rounds a second time. Thus the
+function parses the decimal text, as the REST decoder does.
+"""
+function decimal_to_float(value::Integer, scale::Integer)
+    scale = Int(scale)
+    (abs(value) <= EXACT_FLOAT_INT && scale <= 22) && return Float64(value) / exp10(scale)
+    digits = string(abs(value))
+    length(digits) <= scale && (digits = "0"^(scale - length(digits) + 1) * digits)
+    text = string(value < 0 ? "-" : "", digits[1:end-scale], ".", digits[end-scale+1:end], "0")
+    return parse(Float64, text)
+end
+
+# cv(R, x): convert the Arrow value `x` to the target type `R`.
 @inline cv(::Type{R}, x) where {R} = convert(R, x)
 @inline cv(::Type{Union{Missing,R}}, x) where {R} = x === missing ? missing : cv(R, x)
 @inline cv(::Type{DateTime}, x::Arrow.Timestamp) = datetime_from_unix_ms(timestamp_ms(typeof(x), x.x))
 @inline cv(::Type{Date}, x::Arrow.Date) = Date(Dates.UTD(UNIX_EPOCH_DAYS + Int64(x.x)))
 @inline cv(::Type{DateTime}, x::Arrow.Date) = datetime_from_unix_ms(Int64(x.x))
 @inline cv(::Type{Time}, x::Arrow.Time) = Time(Dates.Nanosecond(time_ns(typeof(x), Int64(x.x))))
-@inline cv(::Type{Float64}, x::Arrow.Decimal{P,S,T}) where {P,S,T} = Float64(x.value) / exp10(S)
+@inline cv(::Type{Float64}, x::Arrow.Decimal{P,S,T}) where {P,S,T} = decimal_to_float(x.value, S)
 @inline cv(::Type{BigFloat}, x::Arrow.Decimal{P,S,T}) where {P,S,T} =
     BigFloat(BigInt(x.value)) / BigFloat(10)^S
 @inline cv(::Type{String}, x::AbstractString) = String(x)
@@ -66,7 +87,7 @@ function cv(::Type{Vector{E}}, x::AbstractVector) where {E}
     end
     return out
 end
-# BYTES arrive as byte vectors already; do not treat them as an array of values.
+# BYTES values arrive as byte vectors. Do not use them as arrays of values.
 cv(::Type{Vector{UInt8}}, x::AbstractVector{UInt8}) = Vector{UInt8}(x)
 
 function _convert_column(::Type{R}, col::AbstractVector) where {R}
@@ -85,7 +106,7 @@ function convert_column(col::AbstractVector)
 end
 
 """
-Decode an Arrow IPC stream (schema message followed by record batches) into
+Decode an Arrow IPC stream (a schema message, then record batches). Return
 `(names, columns)` with plain Julia vectors.
 """
 function decode_arrow(bytes::Vector{UInt8})
@@ -96,9 +117,9 @@ function decode_arrow(bytes::Vector{UInt8})
 end
 
 """
-Reorder Arrow-derived columns to match the REST schema and make their element
-types identical to what the REST decoder would have produced, so the download
-method never changes the shape of the result.
+Put the Arrow columns in the sequence of the REST schema. Change their element
+types to the types from the REST decoder. Thus the download method does not change
+the shape of the result.
 """
 function align_columns(fields::Vector{Field}, names::Vector{Symbol}, cols::Vector{Any})
     out = Vector{Any}(undef, length(fields))
@@ -115,7 +136,7 @@ function align_columns(fields::Vector{Field}, names::Vector{Symbol}, cols::Vecto
             col = try
                 convert(Vector{want}, col)
             catch
-                col   # an unmodelled type: keep what Arrow gave us
+                col   # a type that the package does not model: keep the Arrow column
             end
         end
         out[j] = col

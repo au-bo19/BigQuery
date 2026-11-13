@@ -1,8 +1,8 @@
 """
     BigQuery.Connection
 
-A connection to BigQuery: a billing project plus credentials. Create one with
-[`bq_connect`](@ref) (or `DBInterface.connect(BigQuery.Connection, ...)`).
+A connection to BigQuery: a billing project and credentials. To make a connection,
+use [`bq_connect`](@ref) or `DBInterface.connect(BigQuery.Connection, ...)`.
 """
 mutable struct Connection <: DBInterface.Connection
     project::String
@@ -13,8 +13,8 @@ mutable struct Connection <: DBInterface.Connection
     endpoint::String
     storage_endpoint::String
     max_retries::Int
-    # Set to false once the Storage Read API has refused us, so later queries go
-    # straight to REST instead of failing over every time.
+    # The package sets this field to false when the Storage Read API refuses a request.
+    # Then the subsequent queries go directly to REST. They do not try that API again.
     storage_ok::Bool
     isopen::Bool
 end
@@ -29,27 +29,27 @@ end
 """
     bq_connect([project]; dataset, location, credentials, token, scopes) -> Connection
 
-Connect to BigQuery. `project` is the project that queries are billed to; when
-left out it is taken from `GOOGLE_CLOUD_PROJECT` or from the credentials.
+Connect to BigQuery. BigQuery bills the queries to `project`. If you do not give
+`project`, the package uses `GOOGLE_CLOUD_PROJECT` or the project in the credentials.
 
-Authentication, first match wins:
+The package uses the first authentication method in this list that applies:
 
-* `token = "ya29..."` — an access token you already have, or a zero-argument
-  function returning one (called again whenever a fresh token is needed);
-* `credentials = "key.json"` — path to a service account key or to a
-  `gcloud auth application-default login` file (a parsed `Dict` works too);
-* otherwise Application Default Credentials: `GOOGLE_APPLICATION_CREDENTIALS`,
-  the gcloud application-default login, the VM metadata server, the gcloud CLI.
+* `token = "ya29..."`: an access token that you have. This can also be a function
+  with no arguments that returns a token. The package calls the function again
+  each time that it must have a new token.
+* `credentials = "key.json"`: the path to a service account key, or to the file from
+  `gcloud auth application-default login`. A parsed `Dict` is also possible.
+* Application Default Credentials: `GOOGLE_APPLICATION_CREDENTIALS`, the gcloud
+  application-default login, the VM metadata server, and then the gcloud CLI.
 
 Other keywords:
 
-* `dataset` — default dataset for unqualified table names (`"dataset"` or
-  `"project.dataset"`);
-* `location` — job location such as `"EU"` or `"us-central1"`; usually inferred
-  by BigQuery from the tables in the query;
-* `scopes` — OAuth scopes for service account keys. Add
-  `"https://www.googleapis.com/auth/drive.readonly"` to query Google Sheets
-  backed tables.
+* `dataset`: the default dataset for table names without a dataset (`"dataset"` or
+  `"project.dataset"`).
+* `location`: the job location, for example `"EU"` or `"us-central1"`. Usually,
+  BigQuery finds the location from the tables in the query.
+* `scopes`: the OAuth scopes for service account keys. To query tables that use
+  Google Sheets, add `"https://www.googleapis.com/auth/drive.readonly"`.
 
 # Examples
 ```julia
@@ -101,15 +101,33 @@ end
 
 access_token(conn::Connection) = access_token(conn.credentials, conn.downloader)
 
+"The quota project to send in the `x-goog-user-project` header, or an empty string."
+user_project(conn::Connection) = something(quota_project(conn.credentials), "")
+
+"""
+The headers that identify the caller: the access token, the user agent, and the
+quota project if the credentials have one.
+"""
+function auth_headers(conn::Connection)
+    headers = Pair{String,String}[
+        "Authorization" => "Bearer " * access_token(conn),
+        "User-Agent" => USER_AGENT,
+    ]
+    project = user_project(conn)
+    isempty(project) || push!(headers, "x-goog-user-project" => project)
+    return headers
+end
+
 function check_open(conn::Connection)
     conn.isopen || throw(ArgumentError("this BigQuery connection has been closed"))
     return nothing
 end
 
 """
-Send an authorized request with an optional JSON `payload` and return the
-successful response. Retries transient failures (network errors, 429/5xx, rate
-limits) with exponential backoff and refreshes the access token once on a 401.
+Send an authorized request with an optional JSON `payload`. Return the response if
+it is successful. After a temporary failure (a network error, 429/5xx or a rate
+limit), the function tries again. The time between the attempts increases
+exponentially. After a 401, the function gets a new access token one time.
 """
 function send_request(conn::Connection, method::AbstractString, url::AbstractString;
                       payload::Union{Nothing,Vector{UInt8}} = nothing,
@@ -118,11 +136,8 @@ function send_request(conn::Connection, method::AbstractString, url::AbstractStr
     reauthed = false
     while true
         attempt += 1
-        headers = Pair{String,String}[
-            "Authorization" => "Bearer " * access_token(conn),
-            "User-Agent" => USER_AGENT,
-            "Accept" => "application/json",
-        ]
+        headers = auth_headers(conn)
+        push!(headers, "Accept" => "application/json")
         payload === nothing || push!(headers, "Content-Type" => "application/json")
         append!(headers, extra_headers)
         resp = try
@@ -150,7 +165,7 @@ function send_request(conn::Connection, method::AbstractString, url::AbstractStr
     end
 end
 
-"Call the BigQuery REST API and return the raw response body. See [`send_request`](@ref)."
+"Call the BigQuery REST API and return the raw response body. Refer to [`send_request`](@ref)."
 function api_call(conn::Connection, method::AbstractString, path::AbstractString;
                   query = (), body = nothing)
     url = conn.endpoint * "/bigquery/v2/" * path
