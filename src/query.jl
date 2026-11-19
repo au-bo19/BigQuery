@@ -12,8 +12,10 @@ const POLL_TIMEOUT_MS = 10_000
 The result of `DBInterface.execute`: the result columns and data about the job. It
 is a Tables.jl table, thus `DataFrame(result)` (or a different sink) works.
 Important fields: `job_id`, `location`, `total_rows`, `affected_rows` (for DML
-statements), `bytes_processed`, `cache_hit` and `method`. `method` shows how the
-package downloaded the rows: `:inline`, `:arrow` or `:rest`.
+statements), `bytes_processed`, `bytes_billed`, `cache_hit` and `method`. `method`
+shows how the package downloaded the rows: `:inline`, `:arrow` or `:rest`.
+`bytes_billed` is what on-demand pricing charges for; it is `nothing` when
+BigQuery does not report it.
 """
 struct QueryResult
     names::Vector{Symbol}
@@ -24,6 +26,7 @@ struct QueryResult
     total_rows::Int
     affected_rows::Union{Nothing,Int}
     bytes_processed::Union{Nothing,Int}
+    bytes_billed::Union{Nothing,Int}
     cache_hit::Bool
     method::Symbol
 end
@@ -42,7 +45,15 @@ function Base.show(io::IO, r::QueryResult)
     isempty(r.job_id) || print(io, ", job ", r.job_id)
     r.affected_rows === nothing || print(io, ", ", r.affected_rows, " rows affected")
     r.bytes_processed === nothing || print(io, ", ", r.bytes_processed, " bytes processed")
+    r.bytes_billed === nothing || print(io, ", billed ", format_bytes(r.bytes_billed))
     r.cache_hit && print(io, " (cached)")
+end
+
+"Print the bytes billed for a finished query, as bigrquery does."
+function report_billed(billed::Union{Nothing,Int}, cache_hit::Bool)
+    billed === nothing && return nothing
+    @info string("Billed: ", format_bytes(billed), cache_hit ? " (cached result)" : "")
+    return nothing
 end
 
 function unique_names(names::Vector{String})
@@ -62,14 +73,14 @@ function unique_names(names::Vector{String})
 end
 
 function make_result(fields::Vector{Field}, columns::Vector{Any}; job_id = "", location = "",
-                     affected_rows = nothing, bytes_processed = nothing, cache_hit = false,
-                     method = :inline)
+                     affected_rows = nothing, bytes_processed = nothing, bytes_billed = nothing,
+                     cache_hit = false, method = :inline)
     names = unique_names(String[f.name for f in fields])
     cols = AbstractVector[narrow_column(c) for c in columns]
     nrows = isempty(cols) ? 0 : length(first(cols))
     lookup = Dict{Symbol,Int}(n => i for (i, n) in enumerate(names))
     return QueryResult(names, cols, lookup, job_id, location, nrows, affected_rows,
-                       bytes_processed, cache_hit, method)
+                       bytes_processed, bytes_billed, cache_hit, method)
 end
 
 to_dataframe(r::QueryResult) = DataFrame(r.columns, r.names; copycols = false)
@@ -177,11 +188,27 @@ function cancel_job(conn::Connection, project::String, job_id::String, location:
     return nothing
 end
 
-function destination_table(conn::Connection, project::String, job_id::String, location::Union{Nothing,String})
-    job = api_json(conn, "GET", job_path(project, job_id); query = ["location" => location])
-    config = get(job, "configuration", nothing)
-    query = config isa AbstractDict ? get(config, "query", nothing) : nothing
-    dest = query isa AbstractDict ? get(query, "destinationTable", nothing) : nothing
+"Follow `keys` into nested JSON objects. Return `nothing` if a key is missing."
+function dig(x, keys::String...)
+    for k in keys
+        x isa AbstractDict || return nothing
+        x = get(x, k, nothing)
+    end
+    return x
+end
+
+"The job resource (jobs.get), or `nothing` if BigQuery does not give it."
+function get_job(conn::Connection, project::String, job_id::String, location::Union{Nothing,String})
+    try
+        return api_json(conn, "GET", job_path(project, job_id); query = ["location" => location])
+    catch e
+        e isa Union{BigQueryError,NetworkError} || rethrow()
+        return nothing
+    end
+end
+
+function destination_table(job)
+    dest = dig(job, "configuration", "query", "destinationTable")
     dest isa AbstractDict || return nothing
     for key in ("projectId", "datasetId", "tableId")
         get(dest, key, nothing) isa AbstractString || return nothing
@@ -305,27 +332,29 @@ function run_query(conn::Connection, sql::AbstractString;
 
     fields = parse_schema(get(meta, "schema", nothing))
     total = parse_count(get(meta, "totalRows", 0))
+    first_cols = new_columns(fields)
+    n1 = range === nothing ? 0 : decode_rows!(first_cols, fields, s, range)
+    page_token = string(something(get(meta, "pageToken", nothing), ""))
+    inline = isempty(fields) || n1 >= total || isempty(page_token)
+
+    # jobs.query reports the bytes billed, but getQueryResults (the poll) does not. jobs.get
+    # has them, and also the destination table that a bulk download needs.
+    billed = optional_count(get(meta, "totalBytesBilled", nothing))
+    job = (isempty(job_id) || (inline && billed !== nothing)) ? nothing :
+          get_job(conn, job_project, job_id, job_location)
+    billed === nothing && (billed = optional_count(dig(job, "statistics", "query", "totalBytesBilled")))
     stats = (job_id = job_id,
              location = something(job_location, ""),
              affected_rows = optional_count(get(meta, "numDmlAffectedRows", nothing)),
              bytes_processed = optional_count(get(meta, "totalBytesProcessed", nothing)),
+             bytes_billed = billed,
              cache_hit = get(meta, "cacheHit", false) === true)
-
-    first_cols = new_columns(fields)
-    n1 = range === nothing ? 0 : decode_rows!(first_cols, fields, s, range)
-    page_token = string(something(get(meta, "pageToken", nothing), ""))
-    if isempty(fields) || n1 >= total || isempty(page_token)
-        return make_result(fields, first_cols; stats..., method = :inline)
-    end
+    progress && report_billed(billed, stats.cache_hit)
+    inline && return make_result(fields, first_cols; stats..., method = :inline)
 
     # The first page did not contain all the rows: download them in bulk.
     isempty(job_id) && throw(BigQueryError("BigQuery returned a partial result without a job to page through"))
-    dest = try
-        destination_table(conn, job_project, job_id, job_location)
-    catch e
-        e isa BigQueryError || rethrow()
-        nothing
-    end
+    dest = job === nothing ? nothing : destination_table(job)
     bar = Progress(progress, total)
     try
         if dest !== nothing
@@ -378,8 +407,9 @@ Keywords:
 * `method`: how the package downloads large results. `:auto` (the default) uses
   the Storage Read API. If that API is not available, it uses REST pages. `:arrow`
   and `:rest` select one of the two methods.
-* `progress`: show a progress line for long downloads (the default is true in
-  interactive sessions).
+* `progress`: when the query finishes, log the bytes billed (`[ Info: Billed: 2.35 GB`),
+  and show a progress line for long downloads. The default is true in interactive
+  sessions. The number is also in the `bytes_billed` field of `DBInterface.execute`.
 * `max_streams`: the number of parallel Storage API streams (default 8).
 * `compression`: the Storage API compression: `:zstd` (default), `:lz4` or `:none`.
 * `concurrency`, `page_size`: the number of parallel requests, and the rows in

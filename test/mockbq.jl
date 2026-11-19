@@ -160,7 +160,7 @@ function handle(s::Server, req::HTTP.Request)
         if job[:polls] > 0
             return json_response(200, Dict("jobComplete" => false, "jobReference" => ref))
         end
-        return query_page(s, req, job, ref, 0, int_param(request, "maxResults", typemax(Int)))
+        return query_page(s, req, job, ref, 0, int_param(request, "maxResults", typemax(Int)); billed = true)
     end
 
     # --- jobs.getQueryResults ----------------------------------------------
@@ -201,7 +201,8 @@ function handle(s::Server, req::HTTP.Request)
             query_config["destinationTable"] = Dict("projectId" => project, "datasetId" => dataset, "tableId" => table)
         end
         return json_response(200, Dict("id" => job_id, "configuration" => Dict("query" => query_config),
-                                       "status" => Dict("state" => "DONE")))
+                                       "status" => Dict("state" => "DONE"),
+                                       "statistics" => Dict("query" => Dict("totalBytesBilled" => BYTES_BILLED))))
     end
 
     # --- tables.get / tabledata.list ----------------------------------------
@@ -236,9 +237,13 @@ function handle(s::Server, req::HTTP.Request)
     return error_response(404, "notFound", "Not found: $path")
 end
 
-function query_page(s::Server, req, job, ref, start::Int, max_results::Int)
+const BYTES_BILLED = "10485760"
+
+# As in BigQuery, jobs.query reports the bytes billed (`billed`), and getQueryResults does not.
+function query_page(s::Server, req, job, ref, start::Int, max_results::Int; billed::Bool = false)
     behaviour = job[:behaviour]
     extra = Dict{String,Any}("jobReference" => ref, "totalBytesProcessed" => "12345", "cacheHit" => false)
+    billed && (extra["totalBytesBilled"] = BYTES_BILLED)
     if haskey(behaviour, :dml)
         return json_response(200, merge(extra, Dict("jobComplete" => true, "numDmlAffectedRows" => string(behaviour[:dml]))))
     end

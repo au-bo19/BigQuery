@@ -80,6 +80,31 @@
             @test all(r -> r.params["location"] == "US", polls)      # each poll sends the location of the job
         end
 
+        @testset "bytes billed" begin
+            # A fast query: jobs.query reports the bytes billed, and no other request is necessary.
+            reset_log!(server)
+            res = DBInterface.execute(con, "SELECT small")
+            @test res.bytes_billed == 10_485_760 && length(requests(server)) == 1
+            @test occursin("billed 10.5 MB", sprint(show, res))
+            # A slow query: the poll does not report them. One jobs.get gets them.
+            reset_log!(server)
+            res = DBInterface.execute(con, "SELECT slow")
+            @test res.bytes_billed == 10_485_760
+            @test count(r -> occursin("/jobs/job_", r.path), requests(server)) == 1
+            # A large result reads jobs.get for the destination table anyway: one request for both.
+            reset_log!(server)
+            @test B.run_query(con, "SELECT large"; method = :rest, progress = false).bytes_billed == 10_485_760
+            @test count(r -> occursin("/jobs/job_", r.path), requests(server)) == 1
+
+            @test_logs (:info, "Billed: 10.5 MB") bq_query(con, "SELECT small"; progress = true)
+            @test_logs (:info, "Billed: 10.5 MB") bq_query(con, "SELECT slow"; progress = true)
+            @test_logs bq_query(con, "SELECT small"; progress = false)
+
+            @test B.format_bytes(0) == "0 B" && B.format_bytes(999) == "999 B"
+            @test B.format_bytes(1000) == "1 kB" && B.format_bytes(999_999) == "1 MB"
+            @test B.format_bytes(2_354_000_000) == "2.35 GB" && B.format_bytes(10^15) == "1 PB"
+        end
+
         @testset "errors" begin
             add_query!(server, "SELEC 1"; error = ("invalidQuery", "Syntax error: Unexpected identifier \"SELEC\" at [1:1]"))
             add_query!(server, "SELECT secret"; error = ("accessDenied", "Access Denied: Table proj:ds.secret"))

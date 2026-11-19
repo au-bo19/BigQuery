@@ -19,6 +19,20 @@ function format_count(n::Integer)
     return string(n)
 end
 
+"A byte count in decimal units with three significant digits, for example \"2.35 GB\"."
+function format_bytes(n::Integer)
+    units = ("B", "kB", "MB", "GB", "TB", "PB", "EB")
+    x = Float64(n)
+    i = 1
+    while i < length(units) && round(x; sigdigits = 3) >= 1000
+        x /= 1000
+        i += 1
+    end
+    s = string(i == 1 ? Int(x) : round(x; sigdigits = 3))
+    endswith(s, ".0") && (s = chop(s; tail = 2))
+    return string(s, " ", units[i])
+end
+
 function advance!(p::Progress, n::Integer)
     done = Threads.atomic_add!(p.done, Int(n)) + n
     p.enabled || return nothing

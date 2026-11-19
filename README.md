@@ -24,11 +24,6 @@ BigQuery.jl is written entirely in Julia. It needs no other language runtime,
 no command-line tool and no storage bucket; the only compiled libraries it
 uses, libcurl, OpenSSL and zlib, ship with Julia. Managing datasets is not covered.
 
-This is version 0.1. Its test suite runs the whole client against local
-imitations of BigQuery's APIs, but it has not yet been run against a real
-BigQuery project; see [Checking your setup](#checking-your-setup) before
-relying on it.
-
 ## Download methods
 
 Results of up to 10,000 rows come back with the query itself. Larger results
@@ -193,7 +188,7 @@ values; use `bq_param(value, "TYPE")` where they cannot be, as in
 `bq_param(missing, "INT64")` or `bq_param(Int[], "ARRAY<INT64>")`.
 
 The same through DBInterface.jl, which returns a Tables.jl table that also
-carries the job's id, bytes processed and rows affected:
+carries the job's id, bytes processed, bytes billed and rows affected:
 
 ``` julia
 using DBInterface, DataFrames
