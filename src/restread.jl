@@ -15,7 +15,8 @@ function fetch_table_chunk(conn::Connection, table::TableRef, fields::Vector{Fie
     cols = new_columns(fields)
     got = 0
     while got < count
-        raw = api_call(conn, "GET", table_data_path(table); query = [
+        counter = byte_counter(progress)
+        raw = api_call(conn, "GET", table_data_path(table); on_bytes = counter, query = [
             "startIndex" => start + got,
             "maxResults" => count - got,
             "formatOptions.useInt64Timestamp" => "true",
@@ -29,7 +30,7 @@ function fetch_table_chunk(conn::Connection, table::TableRef, fields::Vector{Fie
         m == 0 && throw(BigQueryError(
             "BigQuery returned no rows at offset $(start + got) of $(table); expected $(count - got) more"))
         got += m
-        advance!(progress, m)
+        settle!(progress, counter, m)
     end
     return cols
 end
@@ -100,7 +101,9 @@ function read_query_pages(conn::Connection, project::String, job_id::String,
     chunks = Vector{Any}[]
     token = page_token
     while !isempty(token)
-        raw = api_call(conn, "GET", "projects/$(escapeuri(project))/queries/$(escapeuri(job_id))"; query = [
+        counter = byte_counter(progress)
+        raw = api_call(conn, "GET", "projects/$(escapeuri(project))/queries/$(escapeuri(job_id))";
+                       on_bytes = counter, query = [
             "location" => location,
             "pageToken" => token,
             "formatOptions.useInt64Timestamp" => "true",
@@ -109,7 +112,7 @@ function read_query_pages(conn::Connection, project::String, job_id::String,
         cols = new_columns(fields)
         m = range === nothing ? 0 : decode_rows!(cols, fields, s, range)
         m > 0 && push!(chunks, cols)
-        advance!(progress, m)
+        settle!(progress, counter, m)
         token = string(something(get(meta, "pageToken", nothing), ""))
     end
     return chunks

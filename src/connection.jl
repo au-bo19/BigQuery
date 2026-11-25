@@ -16,6 +16,8 @@ mutable struct Connection <: DBInterface.Connection
     # The package sets this field to false when the Storage Read API refuses a request.
     # Then the subsequent queries go directly to REST. They do not try that API again.
     storage_ok::Bool
+    # Log the bytes billed after each query. The default of the `show_billed` keyword.
+    show_billed::Bool
     isopen::Bool
 end
 
@@ -27,7 +29,7 @@ function Base.show(io::IO, c::Connection)
 end
 
 """
-    bq_connect([project]; dataset, location, credentials, token, scopes) -> Connection
+    bq_connect([project]; dataset, location, credentials, token, scopes, show_billed) -> Connection
 
 Connect to BigQuery. BigQuery bills the queries to `project`. If you do not give
 `project`, the package uses `GOOGLE_CLOUD_PROJECT` or the project in the credentials.
@@ -50,6 +52,9 @@ Other keywords:
   BigQuery finds the location from the tables in the query.
 * `scopes`: the OAuth scopes for service account keys. To query tables that use
   Google Sheets, add `"https://www.googleapis.com/auth/drive.readonly"`.
+* `show_billed`: log the bytes billed after each query (`[ Info: Billed: 2.35 GB`).
+  The default is `true`, in scripts too. A query can override it with its own
+  `show_billed` keyword, and `con.show_billed = false` changes it later.
 
 # Examples
 ```julia
@@ -65,7 +70,8 @@ function bq_connect(project::Union{Nothing,AbstractString} = nothing;
                     scopes = DEFAULT_SCOPES,
                     endpoint::AbstractString = "https://bigquery.googleapis.com",
                     storage_endpoint::AbstractString = "https://bigquerystorage.googleapis.com",
-                    max_retries::Integer = 5)
+                    max_retries::Integer = 5,
+                    show_billed::Bool = true)
     dl = make_downloader()
     creds = if token !== nothing
         token isa AbstractString ? StaticToken(String(strip(token))) : TokenProvider(token)
@@ -96,7 +102,7 @@ function bq_connect(project::Union{Nothing,AbstractString} = nothing;
         location === nothing ? nothing : String(location),
         creds, dl,
         String(rstrip(endpoint, '/')), String(rstrip(storage_endpoint, '/')),
-        Int(max_retries), true, true)
+        Int(max_retries), true, show_billed, true)
 end
 
 access_token(conn::Connection) = access_token(conn.credentials, conn.downloader)
@@ -131,7 +137,8 @@ exponentially. After a 401, the function gets a new access token one time.
 """
 function send_request(conn::Connection, method::AbstractString, url::AbstractString;
                       payload::Union{Nothing,Vector{UInt8}} = nothing,
-                      extra_headers = Pair{String,String}[])
+                      extra_headers = Pair{String,String}[],
+                      on_bytes::Union{Nothing,Function} = nothing)
     attempt = 0
     reauthed = false
     while true
@@ -141,7 +148,8 @@ function send_request(conn::Connection, method::AbstractString, url::AbstractStr
         payload === nothing || push!(headers, "Content-Type" => "application/json")
         append!(headers, extra_headers)
         resp = try
-            http_request(conn.downloader, method, url; headers = headers, body = payload, timeout = 600)
+            http_request(conn.downloader, method, url; headers = headers, body = payload, timeout = 600,
+                         on_bytes = on_bytes)
         catch e
             (e isa NetworkError && attempt <= conn.max_retries) || rethrow()
             nothing
@@ -165,14 +173,17 @@ function send_request(conn::Connection, method::AbstractString, url::AbstractStr
     end
 end
 
-"Call the BigQuery REST API and return the raw response body. Refer to [`send_request`](@ref)."
+"""
+Call the BigQuery REST API and return the raw response body. Refer to [`send_request`](@ref).
+`on_bytes` (a [`ByteCounter`](@ref), for example) sees the response bytes while they arrive.
+"""
 function api_call(conn::Connection, method::AbstractString, path::AbstractString;
-                  query = (), body = nothing)
+                  query = (), body = nothing, on_bytes::Union{Nothing,Function} = nothing)
     url = conn.endpoint * "/bigquery/v2/" * path
     qs = query_string(query)
     isempty(qs) || (url *= "?" * qs)
     payload = body === nothing ? nothing : Vector{UInt8}(codeunits(JSON.json(body)))
-    return send_request(conn, method, url; payload = payload).body
+    return send_request(conn, method, url; payload = payload, on_bytes = on_bytes).body
 end
 
 api_json(conn::Connection, method::AbstractString, path::AbstractString; kwargs...) =

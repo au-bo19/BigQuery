@@ -67,10 +67,10 @@ the dataset covers the latter). The dataset must already exist.
 ``` julia
 # BigQuery.jl is not in the General registry yet. Install it from its folder:
 using Pkg
-Pkg.develop(path = "path/to/bq-jl")
+Pkg.develop(path = "path/to/package")
 
 # Or from a Git repository:
-# Pkg.add(url = "https://github.com/<user>/BigQuery.jl")
+# Pkg.add(url = "https://github.com/...")
 ```
 
 Julia 1.10 or newer is required. Development and testing so far have been on
@@ -216,6 +216,10 @@ DBInterface.close!(con)
 See the docstrings (`?bq_connect`, `?bq_query`, `?bq_read_table`,
 `?bq_write_table`) for the remaining options, such as `max_bytes_billed`,
 `location` and `progress`.
+
+Each query logs what it billed (`[ Info: Billed: 2.35 GB`), in the REPL and in
+scripts alike. To silence it, pass `show_billed = false` to `bq_connect` (or set
+`con.show_billed = false` later), or to a single `bq_query` / `bq_read_table` call.
 
 ## Data types
 

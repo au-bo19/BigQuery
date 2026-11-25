@@ -144,18 +144,19 @@ url_for_message(url::AbstractString) = String(first(split(url, '?')))
 
 function http_request(dl::Downloads.Downloader, method::AbstractString, url::AbstractString;
                       headers = Pair{String,String}[], body::Union{Nothing,Vector{UInt8}} = nothing,
-                      timeout::Real = Inf)
+                      timeout::Real = Inf, on_bytes::Union{Nothing,Function} = nothing)
     out = IOBuffer()
     hdrs = Any[h for h in headers]
+    # `on_bytes` is a Downloads progress callback: it sees the bytes while they arrive.
     resp = if body === nothing
         Downloads.request(url; method = method, output = out, headers = hdrs,
-                          downloader = dl, throw = false, timeout = timeout)
+                          downloader = dl, throw = false, timeout = timeout, progress = on_bytes)
     else
         # Without this header, libcurl waits for "100 Continue" before it uploads over HTTP/1.1.
         push!(hdrs, "Expect" => nothing)
         with_request_body(body) do
             Downloads.request(url; method = method, output = out, headers = hdrs,
-                              downloader = dl, throw = false, timeout = timeout)
+                              downloader = dl, throw = false, timeout = timeout, progress = on_bytes)
         end
     end
     if resp isa Downloads.RequestError

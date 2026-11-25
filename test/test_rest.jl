@@ -1,7 +1,7 @@
 @testset "queries over REST (mock BigQuery)" begin
     server = MockBQ.Server()
     base = MockBQ.url(server)
-    con = bq_connect("proj"; token = "t", endpoint = base, max_retries = 5)
+    con = bq_connect("proj"; token = "t", endpoint = base, max_retries = 5, show_billed = false)
     small = truth_table(50)
     large = truth_table(25_000)
     add_table!(server, "ds.small", SCHEMA, rest_rows(small))
@@ -52,6 +52,18 @@
             df = bq_query(con, "SELECT large"; method = :rest, progress = false, page_size = 777)
             check_table(df, large)
             server.max_page_rows = typemax(Int)
+
+            # With a progress line: the same rows, and no part of the line stays on the screen.
+            path = tempname()
+            open(path, "w") do io
+                redirect_stderr(io) do
+                    check_table(bq_query(con, "SELECT large"; method = :rest, progress = true, page_size = 3_000), large)
+                    check_table(bq_read_table(con, "ds.large"; method = :rest, progress = true), large)
+                end
+            end
+            text = read(path, String)
+            @test isempty(text) || endswith(text, "\r")
+            rm(path)
         end
 
         @testset "transient server errors are retried" begin
@@ -96,9 +108,23 @@
             @test B.run_query(con, "SELECT large"; method = :rest, progress = false).bytes_billed == 10_485_760
             @test count(r -> occursin("/jobs/job_", r.path), requests(server)) == 1
 
-            @test_logs (:info, "Billed: 10.5 MB") bq_query(con, "SELECT small"; progress = true)
-            @test_logs (:info, "Billed: 10.5 MB") bq_query(con, "SELECT slow"; progress = true)
-            @test_logs bq_query(con, "SELECT small"; progress = false)
+            # The log message is on by default, also in a non-interactive session (such as
+            # this test run, or `julia script.jl`) and without a progress line.
+            chatty = bq_connect("proj"; token = "t", endpoint = base)
+            @test chatty.show_billed && !isinteractive()
+            @test_logs (:info, "Billed: 10.5 MB") bq_query(chatty, "SELECT small")
+            @test_logs (:info, "Billed: 10.5 MB") bq_query(chatty, "SELECT slow"; progress = false)
+            @test_logs (:info, "Billed: 10.5 MB") DBInterface.execute(chatty, "SELECT small")
+            add_query!(server, "SELECT * FROM `proj.ds.small` WHERE id > 0"; table = "ds.small")
+            @test_logs (:info, "Billed: 10.5 MB") bq_read_table(chatty, "ds.small"; where = "id > 0", method = :rest)
+            @test_logs bq_read_table(chatty, "ds.small"; method = :rest)     # no query, nothing billed
+            # A query can override the setting of its connection...
+            @test_logs bq_query(chatty, "SELECT small"; show_billed = false)
+            @test_logs bq_query(con, "SELECT small")
+            @test_logs (:info, "Billed: 10.5 MB") bq_query(con, "SELECT small"; show_billed = true)
+            # ... and the setting of a connection can change.
+            chatty.show_billed = false
+            @test_logs bq_query(chatty, "SELECT small")
 
             @test B.format_bytes(0) == "0 B" && B.format_bytes(999) == "999 B"
             @test B.format_bytes(1000) == "1 kB" && B.format_bytes(999_999) == "1 MB"

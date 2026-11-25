@@ -236,11 +236,12 @@ that Arrow.jl cannot decode, or a row count that is different from `expected_row
 With `method = :arrow`, a failure is an error.
 """
 function try_arrow(conn::Connection, method::Symbol, table::TableRef, fields::Vector{Field};
-                   expected_rows::Union{Nothing,Int} = nothing, kwargs...)
+                   expected_rows::Union{Nothing,Int} = nothing,
+                   progress::Progress = Progress(false, 0), kwargs...)
     method == :rest && return nothing
     (method == :auto && !conn.storage_ok) && return nothing
     try
-        cols = read_table_arrow(conn, table, fields; kwargs...)
+        cols = read_table_arrow(conn, table, fields; progress = progress, kwargs...)
         got = isempty(cols) ? 0 : length(first(cols))
         (expected_rows === nothing || got == expected_rows) || throw(BigQueryError(
             "the Storage Read API returned $got rows but the query produced $expected_rows"))
@@ -248,6 +249,7 @@ function try_arrow(conn::Connection, method::Symbol, table::TableRef, fields::Ve
     catch e
         (method == :auto && !(e isa InterruptException)) || rethrow()
         (e isa GrpcError && e.code == 1) && rethrow()        # the call was cancelled
+        clear!(progress)          # the warning must not start in the middle of the progress line
         storage_fallback_warning(e)
         # A permission problem does not go away. Do not try again on each query.
         (e isa GrpcError && e.code in (7, 12)) && (conn.storage_ok = false)
@@ -272,6 +274,7 @@ function run_query(conn::Connection, sql::AbstractString;
                    concurrency::Integer = 8,
                    page_size::Union{Nothing,Integer} = nothing,
                    progress::Bool = isinteractive(),
+                   show_billed::Bool = conn.show_billed,
                    dataset::Union{Nothing,AbstractString} = conn.dataset,
                    location::Union{Nothing,AbstractString} = conn.location,
                    use_cache::Bool = true,
@@ -299,76 +302,84 @@ function run_query(conn::Connection, sql::AbstractString;
     end
 
     project_path = "projects/" * escapeuri(conn.project)
-    s, meta, range = split_response(api_call(conn, "POST", project_path * "/queries"; body = body))
-
-    job_project = conn.project
-    job_id = ""
-    job_location = location === nothing ? nothing : String(location)
-    ref = get(meta, "jobReference", nothing)
-    if ref isa AbstractDict
-        job_project = string(something(get(ref, "projectId", nothing), conn.project))
-        job_id = string(something(get(ref, "jobId", nothing), ""))
-        loc = get(ref, "location", nothing)
-        loc isa AbstractString && (job_location = String(loc))
-    end
-
-    # A long query: wait for it, one poll at a time.
+    # One line for the whole call: "running query (12s)" while BigQuery works, then the rows.
+    bar = Progress(progress, -1)
     try
-        while get(meta, "jobComplete", false) !== true
-            isempty(job_id) && throw(BigQueryError("BigQuery did not return a job reference for an unfinished query"))
-            raw = api_call(conn, "GET", project_path * "/queries/" * escapeuri(job_id); query = [
-                "location" => job_location,
-                "timeoutMs" => POLL_TIMEOUT_MS,
-                "maxResults" => FIRST_PAGE_ROWS,
-                "formatOptions.useInt64Timestamp" => "true",
-            ])
-            s, meta, range = split_response(raw)
+        # The bytes of the response with the first page give the first estimate of the rows per
+        # byte. The query responses do not count as rows in flight: most of them have no rows.
+        counter = byte_counter(bar; inflight = false)
+        s, meta, range = split_response(api_call(conn, "POST", project_path * "/queries";
+                                                 body = body, on_bytes = counter))
+
+        job_project = conn.project
+        job_id = ""
+        job_location = location === nothing ? nothing : String(location)
+        ref = get(meta, "jobReference", nothing)
+        if ref isa AbstractDict
+            job_project = string(something(get(ref, "projectId", nothing), conn.project))
+            job_id = string(something(get(ref, "jobId", nothing), ""))
+            loc = get(ref, "location", nothing)
+            loc isa AbstractString && (job_location = String(loc))
         end
-    catch e
-        # Ctrl-C during the wait: cancel the query. Then it does not continue, and BigQuery does not bill it.
-        (e isa InterruptException && !isempty(job_id)) && cancel_job(conn, job_project, job_id, job_location)
-        rethrow()
-    end
 
-    fields = parse_schema(get(meta, "schema", nothing))
-    total = parse_count(get(meta, "totalRows", 0))
-    first_cols = new_columns(fields)
-    n1 = range === nothing ? 0 : decode_rows!(first_cols, fields, s, range)
-    page_token = string(something(get(meta, "pageToken", nothing), ""))
-    inline = isempty(fields) || n1 >= total || isempty(page_token)
+        # A long query: wait for it, one poll at a time.
+        try
+            while get(meta, "jobComplete", false) !== true
+                isempty(job_id) && throw(BigQueryError("BigQuery did not return a job reference for an unfinished query"))
+                counter = byte_counter(bar; inflight = false)
+                raw = api_call(conn, "GET", project_path * "/queries/" * escapeuri(job_id); on_bytes = counter, query = [
+                    "location" => job_location,
+                    "timeoutMs" => POLL_TIMEOUT_MS,
+                    "maxResults" => FIRST_PAGE_ROWS,
+                    "formatOptions.useInt64Timestamp" => "true",
+                ])
+                s, meta, range = split_response(raw)
+            end
+        catch e
+            # Ctrl-C during the wait: cancel the query. Then it does not continue, and BigQuery does not bill it.
+            (e isa InterruptException && !isempty(job_id)) && cancel_job(conn, job_project, job_id, job_location)
+            rethrow()
+        end
 
-    # jobs.query reports the bytes billed, but getQueryResults (the poll) does not. jobs.get
-    # has them, and also the destination table that a bulk download needs.
-    billed = optional_count(get(meta, "totalBytesBilled", nothing))
-    job = (isempty(job_id) || (inline && billed !== nothing)) ? nothing :
-          get_job(conn, job_project, job_id, job_location)
-    billed === nothing && (billed = optional_count(dig(job, "statistics", "query", "totalBytesBilled")))
-    stats = (job_id = job_id,
-             location = something(job_location, ""),
-             affected_rows = optional_count(get(meta, "numDmlAffectedRows", nothing)),
-             bytes_processed = optional_count(get(meta, "totalBytesProcessed", nothing)),
-             bytes_billed = billed,
-             cache_hit = get(meta, "cacheHit", false) === true)
-    progress && report_billed(billed, stats.cache_hit)
-    inline && return make_result(fields, first_cols; stats..., method = :inline)
+        fields = parse_schema(get(meta, "schema", nothing))
+        total = parse_count(get(meta, "totalRows", 0))
+        first_cols = new_columns(fields)
+        n1 = range === nothing ? 0 : decode_rows!(first_cols, fields, s, range)
+        page_token = string(something(get(meta, "pageToken", nothing), ""))
+        inline = isempty(fields) || n1 >= total || isempty(page_token)
 
-    # The first page did not contain all the rows: download them in bulk.
-    isempty(job_id) && throw(BigQueryError("BigQuery returned a partial result without a job to page through"))
-    dest = job === nothing ? nothing : destination_table(job)
-    bar = Progress(progress, total)
-    try
+        # jobs.query reports the bytes billed, but getQueryResults (the poll) does not. jobs.get
+        # has them, and also the destination table that a bulk download needs.
+        billed = optional_count(get(meta, "totalBytesBilled", nothing))
+        job = (isempty(job_id) || (inline && billed !== nothing)) ? nothing :
+              get_job(conn, job_project, job_id, job_location)
+        billed === nothing && (billed = optional_count(dig(job, "statistics", "query", "totalBytesBilled")))
+        stats = (job_id = job_id,
+                 location = something(job_location, ""),
+                 affected_rows = optional_count(get(meta, "numDmlAffectedRows", nothing)),
+                 bytes_processed = optional_count(get(meta, "totalBytesProcessed", nothing)),
+                 bytes_billed = billed,
+                 cache_hit = get(meta, "cacheHit", false) === true)
+        clear!(bar)
+        show_billed && report_billed(billed, stats.cache_hit)
+        inline && return make_result(fields, first_cols; stats..., method = :inline)
+
+        # The first page did not contain all the rows: download them in bulk.
+        isempty(job_id) && throw(BigQueryError("BigQuery returned a partial result without a job to page through"))
+        dest = job === nothing ? nothing : destination_table(job)
+        set_total!(bar, total)
+        sample!(bar, counter, n1)
         if dest !== nothing
             cols = try_arrow(conn, method, dest, fields; expected_rows = total,
                              ordered = has_order_by(sql), max_streams = max_streams,
                              compression = compression, progress = bar)
             cols === nothing || return make_result(fields, cols; stats..., method = :arrow)
-            finish!(bar)
         elseif method == :arrow
             throw(BigQueryError("this query has no result table to read with the Storage Read API " *
                                 "(scripts, for example); use method = :auto or :rest"))
         end
 
-        bar = Progress(progress, total)
+        restart!(bar)
         advance!(bar, n1)
         chunks = Vector{Any}[first_cols]
         if dest !== nothing
@@ -407,9 +418,13 @@ Keywords:
 * `method`: how the package downloads large results. `:auto` (the default) uses
   the Storage Read API. If that API is not available, it uses REST pages. `:arrow`
   and `:rest` select one of the two methods.
-* `progress`: when the query finishes, log the bytes billed (`[ Info: Billed: 2.35 GB`),
-  and show a progress line for long downloads. The default is true in interactive
-  sessions. The number is also in the `bytes_billed` field of `DBInterface.execute`.
+* `progress`: show a progress line on stderr when the call takes longer than a
+  second: the time while BigQuery runs the query, then the rows downloaded. The
+  default is true in interactive sessions.
+* `show_billed`: when the query finishes, log the bytes billed
+  (`[ Info: Billed: 2.35 GB`). The default is the `show_billed` setting of the
+  connection, which is `true` unless `bq_connect` was told otherwise. The number is
+  also in the `bytes_billed` field of `DBInterface.execute`.
 * `max_streams`: the number of parallel Storage API streams (default 8).
 * `compression`: the Storage API compression: `:zstd` (default), `:lz4` or `:none`.
 * `concurrency`, `page_size`: the number of parallel requests, and the rows in
@@ -441,7 +456,8 @@ df = bq_read_table(con, "my_dataset.my_table"; columns = ["id", "amount"], where
 
 `columns` selects top-level columns. The result has the columns in the sequence of
 `columns`. `where` is a SQL filter that the server applies. For views and external
-tables, the package runs `SELECT ... FROM table`.
+tables, the package runs `SELECT ... FROM table`. Only that query bills bytes, and
+`show_billed` (refer to [`bq_query`](@ref)) controls its log message.
 """
 function bq_read_table(conn::Connection, table::AbstractString;
                        columns = nothing,
@@ -451,7 +467,8 @@ function bq_read_table(conn::Connection, table::AbstractString;
                        compression::Symbol = :zstd,
                        concurrency::Integer = 8,
                        page_size::Union{Nothing,Integer} = nothing,
-                       progress::Bool = isinteractive())
+                       progress::Bool = isinteractive(),
+                       show_billed::Bool = conn.show_billed)
     check_open(conn)
     check_method(method)
     ref = parse_table(conn, table)
@@ -490,7 +507,7 @@ function bq_read_table(conn::Connection, table::AbstractString;
         where === nothing || (sql *= " WHERE " * where)
         return to_dataframe(run_query(conn, sql; method = method, max_streams = max_streams,
             compression = compression, concurrency = concurrency, page_size = page_size,
-            progress = progress))
+            progress = progress, show_billed = show_billed))
     end
     kind in ("VIEW", "EXTERNAL") && return via_query()
 
@@ -507,26 +524,28 @@ function bq_read_table(conn::Connection, table::AbstractString;
     # REST: tabledata.list cannot apply a filter. Thus a `where` requires a query.
     where === nothing || return via_query()
     selected_param = isempty(selected) ? nothing : join(selected, ",")
-    raw = api_call(conn, "GET", table_data_path(ref); query = [
-        "maxResults" => FIRST_PAGE_ROWS,
-        "formatOptions.useInt64Timestamp" => "true",
-        "selectedFields" => selected_param,
-    ])
-    s, page_meta, range = split_response(raw)
-    total = parse_count(get(page_meta, "totalRows", num_rows))
-    first_cols = new_columns(fields)
-    n1 = range === nothing ? 0 : decode_rows!(first_cols, fields, s, range)
-    chunks = Vector{Any}[first_cols]
-    bar = Progress(progress, total)
+    bar = Progress(progress, num_rows)
     try
-        advance!(bar, n1)
+        counter = byte_counter(bar)
+        raw = api_call(conn, "GET", table_data_path(ref); on_bytes = counter, query = [
+            "maxResults" => FIRST_PAGE_ROWS,
+            "formatOptions.useInt64Timestamp" => "true",
+            "selectedFields" => selected_param,
+        ])
+        s, page_meta, range = split_response(raw)
+        total = parse_count(get(page_meta, "totalRows", num_rows))
+        total == num_rows || set_total!(bar, total)
+        first_cols = new_columns(fields)
+        n1 = range === nothing ? 0 : decode_rows!(first_cols, fields, s, range)
+        settle!(bar, counter, n1)
+        chunks = Vector{Any}[first_cols]
         if n1 > 0 && n1 < total
             append!(chunks, read_table_rest(conn, ref, fields, total; start = n1,
                 bytes_per_row = length(range) / n1, concurrency = concurrency,
                 page_size = page_size, selected = selected_param, progress = bar))
         end
+        return finish(concat_chunks(chunks, length(fields)), :rest)
     finally
         finish!(bar)
     end
-    return finish(concat_chunks(chunks, length(fields)), :rest)
 end

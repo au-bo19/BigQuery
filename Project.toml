@@ -1,6 +1,6 @@
 name = "BigQuery"
 uuid = "ac13dc1b-2781-4322-9e33-ccecb0796523"
-version = "0.1.1"
+version = "0.1.2"
 
 [deps]
 Arrow = "69666777-d1a9-59fb-9406-91d4454c9d45"

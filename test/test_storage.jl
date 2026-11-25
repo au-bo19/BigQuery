@@ -33,7 +33,7 @@ end
         add_query!(rest, "SELECT big ORDER BY id"; table = "ds.big")
         add_query!(rest, "SELECT big, ROW_NUMBER() OVER (ORDER BY id) AS r"; table = "ds.big")
         con = bq_connect("billing-proj"; token = "tok", endpoint = MockBQ.url(rest),
-                         storage_endpoint = "http://127.0.0.1:$port", max_retries = 3)
+                         storage_endpoint = "http://127.0.0.1:$port", max_retries = 3, show_billed = false)
 
         # Three streams. Each stream sends a number of record batches.
         prefix = "projects/billing-proj/locations/us/sessions/S1/streams/"
@@ -139,7 +139,7 @@ end
             plan["ReadRows:" * prefix * "b"] = [step(nothing; status = 14, message = "down")]
             write_plan(grpc, plan)
             quick = bq_connect("billing-proj"; token = "tok", endpoint = MockBQ.url(rest),
-                               storage_endpoint = "http://127.0.0.1:$port", max_retries = 1)
+                               storage_endpoint = "http://127.0.0.1:$port", max_retries = 1, show_billed = false)
             @test_throws B.GrpcError bq_query(quick, "SELECT big"; progress = false, method = :arrow)
             @test count(r -> r["method"] == "ReadRows" && endswith(r["routing"], B.escapeuri(prefix * "b")),
                         logged_requests(grpc)) == 2
@@ -172,20 +172,72 @@ end
         @testset "progress line" begin
             write_plan(grpc, healthy)
             path = joinpath(dir, "stderr.txt")
-            bar = B.Progress(true, 30_000)
+            bar = B.Progress(true, 30_000; tick = false)
             bar.started -= 5                       # the download started 5 seconds before
             open(path, "w") do io
                 redirect_stderr(io) do
                     B.advance!(bar, 12_345)
+                    B.draw!(bar)
                     B.finish!(bar)
+                    B.draw!(bar)                   # a late timer call prints nothing
                 end
             end
             text = read(path, String)
             @test occursin("BigQuery: 12.3k / 30.0k rows", text) && endswith(text, "\r")
+            @test count("BigQuery", text) == 1
             @test B.format_count(999) == "999" && B.format_count(5_250_000) == "5.25M"
             quiet = B.Progress(false, 10)
             B.advance!(quiet, 10)
-            @test quiet.done[] == 10 && !quiet.printed
+            @test quiet.done[] == 10 && !quiet.printed && quiet.timer === nothing
+            @test B.byte_counter(quiet) === nothing
+
+            # While the query runs, the line shows the time.
+            running = B.Progress(true, -1; tick = false)
+            running.started -= 7
+            @test startswith(B.status_line(running, time()), "BigQuery: running query (7s)")
+
+            # The timer draws the line without new rows: the line appears on time.
+            open(path, "w") do io
+                redirect_stderr(io) do
+                    ticking = B.Progress(true, 1_000_000)
+                    sleep(B.PROGRESS_DELAY + 0.6)
+                    B.finish!(ticking)
+                end
+            end
+            text = read(path, String)
+            @test count("BigQuery: 0 / 1.0M rows", text) >= 2 && endswith(text, "\r")
+
+            # Bytes in flight count as rows, with the rows per byte of the complete pages.
+            est = B.Progress(true, 10_000; tick = false)
+            first_page = B.byte_counter(est; inflight = false)
+            first_page(0, 1_000, 0, 0)
+            @test est.inflight[] == 0              # a query response: not in flight
+            B.sample!(est, first_page, 100)        # 100 rows in 1000 bytes
+            @test B.shown_count(est) == 0
+            page = B.byte_counter(est)
+            page(0, 2_000, 0, 0)
+            page(0, 5_000, 0, 0)
+            @test page.received == 5_000 && B.shown_count(est) == 500
+            B.settle!(est, page, 400)              # fewer rows than the estimate: the line does not go back
+            @test est.done[] == 400 && est.inflight[] == 0 && B.shown_count(est) == 500
+            retry = B.byte_counter(est)
+            retry(0, 3_000, 0, 0)
+            retry(0, 1_000, 0, 0)                  # the request started again
+            @test retry.received == 4_000 && est.inflight[] == 4_000
+            big = B.byte_counter(est)
+            big(0, 10^9, 0, 0)
+            @test B.shown_count(est) == 10_000     # never more than the total
+            B.restart!(est)
+            @test est.done[] == 0 && est.inflight[] == 0 && B.shown_count(est) == 0
+            @test est.sample_rows[] == 500 && est.sample_bytes[] == 6_000      # the samples stay
+
+            # The REST download reports the bytes of each page through Downloads.
+            rest_bar = B.Progress(true, n; tick = false)
+            B.read_table_rest(con, B.TableRef("billing-proj", "ds", "big"), B.parse_schema(SCHEMA), n;
+                              page_size = 4_000, progress = rest_bar)
+            @test rest_bar.done[] == n && rest_bar.inflight[] == 0
+            @test rest_bar.sample_rows[] == n && rest_bar.sample_bytes[] > 0
+            B.finish!(rest_bar)
         end
 
         @testset "falling back to REST" begin
@@ -194,7 +246,7 @@ end
                 message = "Permission denied: bigquery.readsessions.create on project billing-proj")]
             write_plan(grpc, plan)
             fresh = bq_connect("billing-proj"; token = "tok", endpoint = MockBQ.url(rest),
-                               storage_endpoint = "http://127.0.0.1:$port", max_retries = 3)
+                               storage_endpoint = "http://127.0.0.1:$port", max_retries = 3, show_billed = false)
             @test_throws B.GrpcError bq_query(fresh, "SELECT big"; progress = false, method = :arrow)
             res = @test_logs (:warn, r"falling back to the slower REST download") B.run_query(fresh, "SELECT big"; progress = false)
             @test res.method == :rest
@@ -207,7 +259,7 @@ end
 
             # The client cannot connect to the storage endpoint.
             offline = bq_connect("billing-proj"; token = "tok", endpoint = MockBQ.url(rest),
-                                 storage_endpoint = "http://127.0.0.1:9", max_retries = 0)
+                                 storage_endpoint = "http://127.0.0.1:9", max_retries = 0, show_billed = false)
             res = @test_logs (:warn, r"falling back") B.run_query(offline, "SELECT big"; progress = false)
             @test res.method == :rest && offline.storage_ok
             check_table(DataFrame(res), truth)
